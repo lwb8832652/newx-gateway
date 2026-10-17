@@ -33,41 +33,61 @@ const (
 
 // 默认值。修改默认值必须同步更新 .env.example 与 README。
 const (
-	DefaultHTTPAddr             = ":8080"
-	DefaultEnv                  = EnvDev
-	DefaultMCPEnabled           = true
-	DefaultOpenAPIEnabled       = false
-	DefaultMaxBodyBytes         = 1 << 20
-	DefaultMaxBodyBytesUpload   = 2 << 30
-	DefaultLogLevel             = "info"
-	DefaultLogFormat            = LogFormatJSON
-	DefaultExitWaitTime         = 10 * time.Second
-	DefaultHuobaoBaseURL        = "http://127.0.0.1:5679"
-	DefaultAuthIssuerBaseURL    = "http://127.0.0.1:9099"
-	DefaultTimeoutRead          = 15 * time.Second
-	DefaultTimeoutWrite         = 60 * time.Second
-	DefaultTimeoutGenerate      = 900 * time.Second
-	DefaultTimeoutUpload        = 1800 * time.Second
-	DefaultTimeoutStatic        = 300 * time.Second
-	DefaultTimeoutMCP           = 60 * time.Second
-	DefaultRateWeb              = 120
-	DefaultRateWebGenerate      = 10
-	DefaultRateAdmin            = 300
-	DefaultRateMCP              = 60
-	DefaultMaxConcurrencyGen    = 32
-	DefaultReadyzProbeDownstrm  = false
-	DefaultTrustProxyHeaders    = false
-	DefaultAuthStubEnabled      = false
-	appCodePattern              = `^[a-z][a-z0-9-]{1,31}$`
+	DefaultHTTPAddr            = ":8080"
+	DefaultEnv                 = EnvDev
+	DefaultMCPEnabled          = true
+	DefaultOpenAPIEnabled      = false
+	DefaultMaxBodyBytes        = 1 << 20
+	DefaultMaxBodyBytesUpload  = 2 << 30
+	DefaultLogLevel            = "info"
+	DefaultLogFormat           = LogFormatJSON
+	DefaultExitWaitTime        = 10 * time.Second
+	DefaultHuobaoBaseURL       = "http://127.0.0.1:5679"
+	DefaultAuthIssuerBaseURL   = "http://127.0.0.1:9099"
+	DefaultTimeoutRead         = 15 * time.Second
+	DefaultTimeoutWrite        = 60 * time.Second
+	DefaultTimeoutGenerate     = 900 * time.Second
+	DefaultTimeoutUpload       = 1800 * time.Second
+	DefaultTimeoutStatic       = 300 * time.Second
+	DefaultTimeoutMCP          = 60 * time.Second
+	DefaultRateWeb             = 120
+	DefaultRateWebGenerate     = 10
+	DefaultRateAdmin           = 300
+	DefaultRateMCP             = 60
+	DefaultMaxConcurrencyGen   = 32
+	DefaultReadyzProbeDownstrm = false
+	DefaultTrustProxyHeaders   = false
+	DefaultAuthStubEnabled     = false
+	DefaultDiscoveryRefresh    = 5 * time.Second
+	appCodePattern             = `^[a-z][a-z0-9-]{1,31}$`
 )
 
 var appCodeRe = regexp.MustCompile(appCodePattern)
 
-// AppConfig 是一条应用注册记录：应用编码与下游地址。
-// 地址可以为空，表示该应用已注册但下游尚未接入。
+// AppConfig 是一条应用注册记录：应用编码与下游来源。
+// 地址可以为空（表示已注册但下游尚未接入），但静态地址与注册中心服务至少要有一个。
 type AppConfig struct {
 	Code    string
 	BaseURL string
+	// Service 是注册中心服务名，来自 APPS 中的 nacos:// 形式；为空表示使用静态地址。
+	Service string
+	// UpstreamPath 是上游路径前缀：入口剥掉自身前缀后，再拼上它转发给下游。
+	// 例如入口 /admin/yudao-system/v1/user/page → 上游 /admin-api/system/user/page。
+	UpstreamPath string
+}
+
+// Discovery 是服务发现配置。
+type Discovery struct {
+	// Enabled 为 true 时使用 Nacos 开放 API 解析 nacos:// 形式的服务。
+	Enabled bool
+	// Addr 是 Nacos 地址（host:port）。
+	Addr string
+	// Namespace 是命名空间 ID，为空使用 public。
+	Namespace string
+	// Group 是分组名，为空使用 DEFAULT_GROUP。
+	Group string
+	// Refresh 是后台刷新周期，同时作为本地缓存的 TTL。
+	Refresh time.Duration
 }
 
 // Timeouts 是按路由类别划分的超时预算。
@@ -101,6 +121,8 @@ type Config struct {
 	Apps           []AppConfig
 	MCPEnabled     bool
 	OpenAPIEnabled bool
+
+	Discovery Discovery
 
 	AuthIssuerBaseURL string
 	AuthStubEnabled   bool
@@ -197,13 +219,53 @@ func parse(lookup func(string) (string, bool)) (*Config, error) {
 	}
 	cfg.Apps = apps
 
+	discovery, discoveryErr := parseDiscovery(reader)
+	if discoveryErr != nil {
+		errs = append(errs, discoveryErr)
+	}
+	cfg.Discovery = discovery
+
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
 	return cfg, nil
 }
 
+// parseDiscovery 解析服务发现配置。语法：DISCOVERY=nacos://host:port。
+func parseDiscovery(reader envReader) (Discovery, error) {
+	var discovery Discovery
+
+	raw := reader.str("DISCOVERY", "")
+	if raw != "" {
+		addr, ok := strings.CutPrefix(raw, "nacos://")
+		if !ok || strings.TrimSpace(addr) == "" {
+			return discovery, fmt.Errorf("DISCOVERY 仅支持 nacos://host:port 形式: %q", raw)
+		}
+		discovery.Enabled = true
+		discovery.Addr = strings.TrimSpace(addr)
+	}
+
+	discovery.Namespace = reader.str("DISCOVERY_NAMESPACE", "")
+	discovery.Group = reader.str("DISCOVERY_GROUP", "")
+
+	var errs []error
+	discovery.Refresh = reader.duration("DISCOVERY_REFRESH", DefaultDiscoveryRefresh, &errs)
+	if len(errs) > 0 {
+		return discovery, errors.Join(errs...)
+	}
+	return discovery, nil
+}
+
 // parseApps 解析 APPS。缺省时按 HUOBAO_BASE_URL 生成单条 huobao 注册记录。
+//
+// 条目语法（三部分均可选）：
+//
+//	code                    仅注册编码，地址待接入
+//	code=url                静态地址
+//	code=nacos://service    注册中心服务名
+//	任意形式后接 |/upstream   上游路径前缀，用于路径改写
+//
+// 例：APPS=huobao=http://127.0.0.1:5679|/api/v1,yudao-system=nacos://yudao-system|/admin-api/system
 func parseApps(reader envReader) ([]AppConfig, error) {
 	raw := reader.str("APPS", "")
 	huobaoBaseURL := reader.str("HUOBAO_BASE_URL", DefaultHuobaoBaseURL)
@@ -218,15 +280,27 @@ func parseApps(reader envReader) ([]AppConfig, error) {
 		if entry == "" {
 			continue
 		}
-		code, baseURL, hasURL := strings.Cut(entry, "=")
+
+		code, remainder, hasAddress := strings.Cut(entry, "=")
 		code = strings.TrimSpace(code)
 		if code == "" {
 			return nil, fmt.Errorf("APPS 条目 %q 缺少应用编码", entry)
 		}
+
 		app := AppConfig{Code: code}
-		if hasURL {
-			app.BaseURL = strings.TrimSpace(baseURL)
+		if hasAddress {
+			address, upstreamPath, hasPath := strings.Cut(remainder, "|")
+			address = strings.TrimSpace(address)
+			if service, ok := strings.CutPrefix(address, "nacos://"); ok {
+				app.Service = strings.TrimSpace(service)
+			} else {
+				app.BaseURL = address
+			}
+			if hasPath {
+				app.UpstreamPath = strings.TrimSpace(upstreamPath)
+			}
 		} else if code == "huobao" {
+			// 兼容旧写法：只写 huobao 时回落到 HUOBAO_BASE_URL。
 			app.BaseURL = huobaoBaseURL
 		}
 		apps = append(apps, app)
@@ -279,9 +353,37 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("APPS 应用编码重复: %q", app.Code))
 		}
 		seen[app.Code] = struct{}{}
+
+		// 每个应用必须有可用的下游来源，否则请求会在运行期才失败。
+		if app.BaseURL == "" && app.Service == "" {
+			errs = append(errs, fmt.Errorf("APPS 应用 %q 既无静态地址也无注册中心服务", app.Code))
+		}
 		if app.BaseURL != "" {
 			if err := validateDownstreamURL(app.BaseURL); err != nil {
 				errs = append(errs, fmt.Errorf("APPS 应用 %q 的下游地址非法: %w", app.Code, err))
+			}
+		}
+		if app.Service != "" && !IsValidAppCode(app.Service) {
+			errs = append(errs, fmt.Errorf("APPS 应用 %q 的注册中心服务名非法: %q", app.Code, app.Service))
+		}
+		if app.UpstreamPath != "" && !strings.HasPrefix(app.UpstreamPath, "/") {
+			errs = append(errs, fmt.Errorf("APPS 应用 %q 的上游路径需以 / 开头: %q", app.Code, app.UpstreamPath))
+		}
+	}
+
+	if c.Discovery.Enabled {
+		if err := validateListenAddr(c.Discovery.Addr); err != nil {
+			errs = append(errs, fmt.Errorf("DISCOVERY 地址非法: %w", err))
+		}
+		if c.Discovery.Refresh <= 0 {
+			errs = append(errs, fmt.Errorf("DISCOVERY_REFRESH 必须为正数: %s", c.Discovery.Refresh))
+		}
+	} else {
+		// 反向校验：用了 nacos:// 服务却没开服务发现，启动时必须指出，
+		// 否则要等第一个请求进来才以 50201 失败。
+		for _, app := range c.Apps {
+			if app.Service != "" {
+				errs = append(errs, fmt.Errorf("APPS 应用 %q 使用 nacos:// 服务，但 DISCOVERY 未配置", app.Code))
 			}
 		}
 	}

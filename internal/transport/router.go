@@ -1,31 +1,41 @@
-// Package transport 是入口的协议层：只做路由、参数解析与响应写出，
-// 不包含业务规则，也不直接访问下游。
+// Package transport 是入口的协议层：只做路由、参数解析、上游选择与响应写出，
+// 不包含业务规则。
 //
-// 四类家族各注册一条通配路由，命中后由家族处理器解析 app_code 并校验注册表。
+// 四类家族各注册一条通配路由，命中后由家族处理器解析 app_code、校验注册表、
+// 解析下游实例、按灰度规则筛选、负载均衡选取，最后转发并原样回写响应。
+//
 // 之所以用通配而不是逐条注册下游路由：下游接口会持续增加，
 // 逐条注册等于在入口维护第二份路由真相，长期必然漂移。
 package transport
 
 import (
 	"context"
+	"errors"
 	"log/slog"
-	"net/url"
+	"strings"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"newx-gateway/internal/config"
 	"newx-gateway/internal/contracts"
+	"newx-gateway/internal/discovery"
 	"newx-gateway/internal/httpx"
+	"newx-gateway/internal/lb"
+	"newx-gateway/internal/proxy"
 	"newx-gateway/internal/registry"
 )
 
 // Deps 是处理器可用的依赖集合。显式传递，不使用全局单例，
-// 便于后续把 Huobao 客户端、限流器、鉴权器逐个接进来。
+// 便于后续把鉴权器、限流器逐个接进来。
 type Deps struct {
 	Config   *config.Config
 	Registry *registry.Registry
 	Logger   *slog.Logger
+	// Discovery 解析 app_code 对应的下游实例（静态地址或注册中心）。
+	Discovery discovery.Resolver
+	// Proxy 负责把请求转发到选中的实例。
+	Proxy *proxy.Proxy
 }
 
 // Module 是一个可注册的路由模块。
@@ -50,9 +60,6 @@ func Register(h *server.Hertz, deps Deps, modules ...Module) []string {
 }
 
 // FamilyModule 是四类路由家族的通用实现。
-//
-// 本阶段处理器只完成「解析应用 → 校验注册表 → 返回未实现」三步：
-// 反代接入后替换 handler 内部实现即可，路由注册、错误码与日志字段都保持不变。
 type FamilyModule struct {
 	// Family 是家族标识（web/admin/mcp/openapi），同时用于日志归类与限流分桶。
 	Family    string
@@ -91,12 +98,20 @@ func (m FamilyModule) Register(h *server.Hertz, deps Deps) {
 	}
 }
 
-// handler 是家族占位处理器。
+// handler 是家族处理器：解析应用 → 选实例 → 灰度筛选 → 转发 → 回写响应。
 func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
 		httpx.SetRoute(c, m.Family)
 
-		appCode := c.Param("app_code")
+		// 应用编码与剩余路径一律从 URL 解析，不依赖路由参数：
+		// 框架的通配参数在不同路径形态下取值不一致，而入口路径规则是自己定的，
+		// 自己解析才能保证「同一条规则、同一种结果」。
+		appCode, rest := splitAppCode(m.Prefix, string(c.Path()), m.Versioned)
+		if appCode == "" {
+			httpx.WriteError(c, contracts.CodeRouteNotFound)
+			return
+		}
+
 		registered, found := deps.Registry.Lookup(appCode)
 		if !found {
 			// 未注册的应用一律拒绝：避免未知前缀被透传到任意后端。
@@ -107,26 +122,116 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 		c.Set(contracts.CtxAppCode, registered.Code)
 		c.Set(contracts.CtxDownstream, registered.Code)
 		c.Request.Header.Set(contracts.HeaderAppCode, registered.Code)
-		if host := hostOf(registered.BaseURL); host != "" {
-			c.Set(contracts.CtxUpstreamHost, host)
+
+		if !registered.Routable() || deps.Discovery == nil || deps.Proxy == nil {
+			// 已注册但下游来源缺失：与「未实现」区分，表示配置不完整。
+			httpx.WriteError(c, contracts.CodeDownstreamRefused)
+			return
 		}
 
-		// 反代接入点（后续迭代）：在此调用 clients/huobao 之类的下游客户端，
-		// 把下游响应（状态码、响应头、流式 body）原样写回；
-		// 拨号失败映射 50201、超时映射 50401、下游 5xx 归一为 50202。
-		// 本阶段下游尚未接入，统一返回「未实现」，语义稳定且可被测试断言。
-		httpx.WriteError(c, contracts.CodeNotImplemented)
+		instances, err := deps.Discovery.Resolve(ctx, registered.Code)
+		if err != nil {
+			if deps.Logger != nil {
+				deps.Logger.Warn("解析下游实例失败",
+					"app_code", registered.Code,
+					"request_id", httpx.RequestID(c),
+					"err", err,
+				)
+			}
+			httpx.WriteError(c, contracts.CodeDownstreamRefused)
+			return
+		}
+
+		// 灰度筛选：请求头 version / tag，语义与 yudao 网关保持一致。
+		requestVersion := c.Request.Header.Get("version")
+		requestTag := c.Request.Header.Get("tag")
+		candidates, fellBack := lb.FilterGray(instances, requestVersion, requestTag)
+		if fellBack && deps.Logger != nil {
+			deps.Logger.Warn("灰度筛选无匹配实例，已回退全量",
+				"app_code", registered.Code,
+				"version", requestVersion,
+				"tag", requestTag,
+			)
+		}
+
+		chosen, ok := lb.Pick(candidates)
+		if !ok {
+			httpx.WriteError(c, contracts.CodeDownstreamRefused)
+			return
+		}
+
+		c.Set(contracts.CtxUpstreamHost, chosen.Address())
+
+		target := proxy.Target{
+			Scheme:   chosen.Scheme,
+			Host:     chosen.Address(),
+			Path:     joinPath(registered.UpstreamPath, rest),
+			RawQuery: string(c.Request.URI().QueryString()),
+		}
+
+		if err := deps.Proxy.Forward(ctx, c, target, m.Family); err != nil {
+			var proxyErr *proxy.Error
+			if errors.As(err, &proxyErr) {
+				httpx.WriteError(c, proxyErr.Code)
+				return
+			}
+			httpx.WriteError(c, contracts.CodeDownstreamBad)
+			return
+		}
+
+		// 下游 5xx：响应体仍原样透传（客户端的错误处理不被入口破坏），
+		// 但错误码归类记为 50202，供日志与告警识别。
+		if c.Response.StatusCode() >= 500 {
+			c.Set(contracts.CtxDownstreamErrorCode, int(contracts.CodeDownstreamBad))
+		}
 	}
 }
 
-// hostOf 提取 URL 的主机部分，用于日志字段 upstream_host。
-func hostOf(rawURL string) string {
-	if rawURL == "" {
-		return ""
+// splitAppCode 从请求路径中解析应用编码与剩余路径。
+//
+//	/web/huobao/v1/dramas → ("huobao", "/dramas")
+//	/web/huobao           → ("huobao", "")
+//	/mcp/huobao/tools     → ("huobao", "/tools")
+//
+// 带版本段的家族会再剥掉前导的 /v1；yudao 这类没有版本概念的下游不受影响。
+func splitAppCode(prefix, fullPath string, versioned bool) (string, string) {
+	trimmed := strings.TrimPrefix(fullPath, prefix+"/")
+	if trimmed == "" || trimmed == fullPath {
+		return "", ""
 	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
+
+	code, remainder, found := strings.Cut(trimmed, "/")
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return "", ""
 	}
-	return parsed.Host
+	if !found {
+		return code, ""
+	}
+
+	rest := "/" + remainder
+	if versioned {
+		rest = strings.TrimPrefix(rest, "/v1")
+	}
+	return code, rest
+}
+
+// joinPath 把上游路径前缀与剩余路径拼成完整上游路径，避免出现 // 与空路径。
+func joinPath(prefix, rest string) string {
+	prefix = strings.TrimSuffix(prefix, "/")
+	rest = strings.TrimSpace(rest)
+	if rest != "" && !strings.HasPrefix(rest, "/") {
+		rest = "/" + rest
+	}
+
+	switch {
+	case prefix == "" && rest == "":
+		return "/"
+	case prefix == "":
+		return rest
+	case rest == "" || rest == "/":
+		return prefix
+	default:
+		return prefix + rest
+	}
 }

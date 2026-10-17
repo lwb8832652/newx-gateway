@@ -102,15 +102,15 @@ func TestNewErrorResponse(t *testing.T) {
 
 func TestIsSpoofableHeader(t *testing.T) {
 	cases := map[string]bool{
-		"X-User-Id":          true,
-		"x-user-id":          true,
-		"X-USER-ID":          true,
-		"X-User-Scope":       true,
-		"X-App-Code":         true,
-		"X-Principal-Id":     true,
-		"X-Forwarded-For":    true,
-		"X-Real-Ip":          true,
-		"X-Internal-Trace":   true,
+		"X-User-Id":           true,
+		"x-user-id":           true,
+		"X-USER-ID":           true,
+		"X-User-Scope":        true,
+		"X-App-Code":          true,
+		"X-Principal-Id":      true,
+		"X-Forwarded-For":     true,
+		"X-Real-Ip":           true,
+		"X-Internal-Trace":    true,
 		"x-internal-anything": true,
 		// 入口自己生成并注入的头不在剥离清单中，剥离后由入口重新写入。
 		"X-Request-Id":   false,

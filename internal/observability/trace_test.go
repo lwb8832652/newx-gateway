@@ -28,10 +28,10 @@ func TestParseTraceParentValid(t *testing.T) {
 
 func TestParseTraceParentInvalid(t *testing.T) {
 	cases := map[string]string{
-		"空值":          "",
-		"段数不足":        "00-4bf92f3577b34da6a3ce929d0e0e4736-01",
-		"版本不支持":       "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-		"trace 长度不足":   "00-4bf92f-00f067aa0ba902b7-01",
+		"空值":            "",
+		"段数不足":          "00-4bf92f3577b34da6a3ce929d0e0e4736-01",
+		"版本不支持":         "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"trace 长度不足":    "00-4bf92f-00f067aa0ba902b7-01",
 		"trace 含大写":     "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
 		"trace 非十六进制":   "00-zzz92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
 		"trace 全零":      "00-00000000000000000000000000000000-00f067aa0ba902b7-01",

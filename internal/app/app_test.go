@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -214,29 +215,198 @@ func TestReadyzProbesDownstreamWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestWebFamilyReturnsNotImplemented(t *testing.T) {
-	env := startTestApp(t, nil)
+func TestProxyForwardsRequestAndResponse(t *testing.T) {
+	var (
+		gotMethod    string
+		gotPath      string
+		gotQuery     string
+		gotAppCode   string
+		gotUserID    string
+		gotRequestID string
+	)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotAppCode = r.Header.Get(contracts.HeaderAppCode)
+		gotUserID = r.Header.Get(contracts.HeaderUserID)
+		gotRequestID = r.Header.Get(contracts.HeaderRequestID)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Upstream-Marker", "from-upstream")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"ok":true,"path":"` + r.URL.Path + `"}`))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}}
+	})
+
+	response, body := env.do(t, requestOptions{
+		method: http.MethodPost,
+		path:   "/web/huobao/v1/dramas?page=2&size=10",
+		headers: map[string]string{
+			contracts.HeaderRequestID: "proxy-check-id",
+			contracts.HeaderUserID:    "forged-user",
+		},
+		body: `{"name":"x"}`,
+	})
+
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("下游状态码应被透传，实际 %d，响应 %s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("X-Upstream-Marker"); got != "from-upstream" {
+		t.Errorf("下游响应头应被透传，实际 %q", got)
+	}
+	if !strings.Contains(string(body), `"path":"/dramas"`) {
+		t.Errorf("下游响应体应被原样回写，实际 %s", body)
+	}
+
+	// 入口注入的可信头必须到达下游。
+	if gotMethod != http.MethodPost {
+		t.Errorf("上游方法 = %q，期望 POST", gotMethod)
+	}
+	if gotPath != "/dramas" {
+		t.Errorf("上游路径 = %q，期望 /dramas", gotPath)
+	}
+	if gotQuery != "page=2&size=10" {
+		t.Errorf("上游 Query = %q，应原样透传", gotQuery)
+	}
+	if gotAppCode != "huobao" {
+		t.Errorf("上游 app_code = %q，期望 huobao", gotAppCode)
+	}
+	if gotRequestID != "proxy-check-id" {
+		t.Errorf("上游 request_id = %q，期望 proxy-check-id", gotRequestID)
+	}
+	// 客户端伪造的身份头必须在到达上游前被剥离。
+	if gotUserID != "" {
+		t.Errorf("伪造的 X-User-Id 被透传到了下游: %q", gotUserID)
+	}
+}
+
+func TestProxyRewritesUpstreamPath(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	// 入口 /admin/yudao-system/v1/user/page → 上游 /admin-api/system/user/page
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{
+			Code:         "yudao-system",
+			BaseURL:      upstream.URL,
+			UpstreamPath: "/admin-api/system",
+		}}
+	})
+
+	response, _ := env.do(t, requestOptions{path: "/admin/yudao-system/v1/user/page"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", response.StatusCode)
+	}
+	if gotPath != "/admin-api/system/user/page" {
+		t.Errorf("上游路径 = %q，期望 /admin-api/system/user/page", gotPath)
+	}
+
+	// 家族根路径也应正确改写为上游前缀本身。
+	response, _ = env.do(t, requestOptions{path: "/admin/yudao-system"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("根路径状态码 = %d，期望 200", response.StatusCode)
+	}
+	if gotPath != "/admin-api/system" {
+		t.Errorf("根路径上游 = %q，期望 /admin-api/system", gotPath)
+	}
+}
+
+func TestProxyReportsUnreachableDownstream(t *testing.T) {
+	// 取一个必然无人监听的端口。
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("获取空闲端口失败: %v", err)
+	}
+	deadAddr := "http://" + listener.Addr().String()
+	listener.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: deadAddr}}
+	})
 
 	response, body := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"})
-	if response.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("状态码 = %d，期望 501，响应 %s", response.StatusCode, body)
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 = %d，期望 503，响应 %s", response.StatusCode, body)
 	}
-	decoded := decodeError(t, body)
-	if decoded.Code != int(contracts.CodeNotImplemented) {
-		t.Errorf("错误码 = %d，期望 %d", decoded.Code, contracts.CodeNotImplemented)
+	if decoded := decodeError(t, body); decoded.Code != int(contracts.CodeDownstreamRefused) {
+		t.Errorf("错误码 = %d，期望 %d（下游不可用）", decoded.Code, contracts.CodeDownstreamRefused)
 	}
-	if decoded.RequestID == "" {
-		t.Error("错误响应必须携带 request_id")
+}
+
+func TestProxyPassesThroughDownstreamError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"code":500,"message":"upstream boom"}`))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}}
+	})
+
+	response, body := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"})
+
+	// 下游错误响应必须原样透传：客户端才能按自己的错误码体系处理。
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("状态码 = %d，期望 500", response.StatusCode)
 	}
-	if response.Header.Get(contracts.HeaderRequestID) != decoded.RequestID {
-		t.Error("响应头 X-Request-Id 应与响应体 request_id 一致")
+	if !strings.Contains(string(body), "upstream boom") {
+		t.Errorf("下游错误响应体应被透传，实际 %s", body)
 	}
 
-	// 家族根路径与通配路径都要可命中。
-	for _, path := range []string{"/web/huobao", "/web/huobao/v1", "/web/huobao/v1/dramas/1"} {
-		if _, body := env.do(t, requestOptions{path: path}); decodeError(t, body).Code != int(contracts.CodeNotImplemented) {
-			t.Errorf("路径 %s 未命中 Web 家族", path)
+	// 但错误码归类必须记为 50202，供日志与告警识别。
+	found := false
+	for _, entry := range env.logEntries(t) {
+		if entry["route"] == contracts.FamilyWeb {
+			found = true
+			if int(entry["error_code"].(float64)) != int(contracts.CodeDownstreamBad) {
+				t.Errorf("error_code = %v，期望 %d", entry["error_code"], contracts.CodeDownstreamBad)
+			}
+			if int(entry["status"].(float64)) != 500 {
+				t.Errorf("status = %v，期望 500", entry["status"])
+			}
 		}
+	}
+	if !found {
+		t.Error("缺少 Web 家族的请求日志")
+	}
+}
+
+func TestProxySupportsRangeRequests(t *testing.T) {
+	payload := bytes.Repeat([]byte("abcdefghij"), 100)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "video.mp4", time.Now(), bytes.NewReader(payload))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/static"}}
+	})
+
+	response, body := env.do(t, requestOptions{
+		path:    "/web/huobao/v1/video.mp4",
+		headers: map[string]string{"Range": "bytes=0-99"},
+	})
+
+	if response.StatusCode != http.StatusPartialContent {
+		t.Fatalf("状态码 = %d，期望 206（Range 透传失败）", response.StatusCode)
+	}
+	if len(body) != 100 {
+		t.Errorf("响应体长度 = %d，期望 100（Range 未被正确处理）", len(body))
+	}
+	if got := response.Header.Get("Content-Range"); got == "" {
+		t.Error("Content-Range 响应头应被透传")
 	}
 }
 
@@ -272,7 +442,14 @@ func TestClosedChannelsReportRouteNotFound(t *testing.T) {
 }
 
 func TestEnabledFamiliesAreReachable(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Served-By", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
 	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}}
 		cfg.OpenAPIEnabled = true
 	})
 
@@ -287,14 +464,9 @@ func TestEnabledFamiliesAreReachable(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		response, body := env.do(t, requestOptions{path: tc.path})
-		if response.StatusCode != http.StatusNotImplemented {
-			t.Errorf("路径 %s 状态码 = %d，期望 501", tc.path, response.StatusCode)
-			continue
-		}
-		decoded := decodeError(t, body)
-		if decoded.Code != int(contracts.CodeNotImplemented) {
-			t.Errorf("路径 %s 错误码 = %d", tc.path, decoded.Code)
+		response, _ := env.do(t, requestOptions{path: tc.path})
+		if response.StatusCode != http.StatusOK {
+			t.Errorf("路径 %s 状态码 = %d，期望 200（应被转发到上游）", tc.path, response.StatusCode)
 		}
 	}
 
@@ -369,18 +541,27 @@ func TestForgedInternalHeadersAreStripped(t *testing.T) {
 }
 
 func TestAppCodeIsInjectedByFamilyHandler(t *testing.T) {
-	env := startTestApp(t, nil)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
 
-	if _, body := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"}); decodeError(t, body).Code != int(contracts.CodeNotImplemented) {
-		t.Fatalf("Web 路由行为异常: %s", body)
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}}
+	})
+
+	if response, _ := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"}); response.StatusCode != http.StatusOK {
+		t.Fatalf("Web 路由应成功转发，实际 %d", response.StatusCode)
 	}
 
 	found := false
 	for _, entry := range env.logEntries(t) {
 		if entry["route"] == contracts.FamilyWeb && entry["app_code"] == "huobao" && entry["downstream"] == "huobao" {
 			found = true
-			if entry["upstream_host"] != "127.0.0.1:5679" {
-				t.Errorf("upstream_host = %v，期望 127.0.0.1:5679", entry["upstream_host"])
+			// upstream_host 应记录实际选中的下游实例，而非注册表里的静态地址。
+			host, _ := entry["upstream_host"].(string)
+			if host == "" || host == "127.0.0.1:5679" {
+				t.Errorf("upstream_host = %q，应为实际选中的下游实例", host)
 			}
 		}
 	}
@@ -453,7 +634,16 @@ func TestRequestBodyLimit(t *testing.T) {
 }
 
 func TestRequestLogHasFixedFields(t *testing.T) {
-	env := startTestApp(t, nil)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+	})
 
 	env.do(t, requestOptions{
 		path: "/web/huobao/v1/dramas",
@@ -485,17 +675,24 @@ func TestRequestLogHasFixedFields(t *testing.T) {
 		}
 	}
 
-	if target["status"].(float64) != 501 {
-		t.Errorf("status = %v，期望 501", target["status"])
+	// 转发成功的请求：入口未产生错误，因此 code/error_code 为 0，status 透传下游。
+	if target["status"].(float64) != 200 {
+		t.Errorf("status = %v，期望 200", target["status"])
 	}
-	if target["code"].(float64) != float64(contracts.CodeNotImplemented) {
-		t.Errorf("code = %v，期望 %d", target["code"], contracts.CodeNotImplemented)
+	if target["code"].(float64) != 0 {
+		t.Errorf("code = %v，期望 0（入口未产生错误）", target["code"])
 	}
 	if target["route"] != contracts.FamilyWeb {
 		t.Errorf("route = %v，期望 %s", target["route"], contracts.FamilyWeb)
 	}
 	if target["method"] != http.MethodGet {
 		t.Errorf("method = %v", target["method"])
+	}
+	if target["app_code"] != "huobao" {
+		t.Errorf("app_code = %v，期望 huobao", target["app_code"])
+	}
+	if _, ok := target["upstream_host"].(string); !ok {
+		t.Errorf("upstream_host 应为字符串，实际 %v", target["upstream_host"])
 	}
 
 	// 敏感信息绝不能落盘。

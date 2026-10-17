@@ -3,8 +3,13 @@
 统一入口（API Gateway）工程。目标是为 Web、Admin、MCP、OpenAPI 四类调用方提供唯一的入口边界：
 路由、鉴权、限流、超时、协议适配、日志与链路追踪都在这里收敛，业务能力由下游服务提供。
 
-**当前状态：P0 脚手架。** 已完成工程骨架、配置与契约、四类路由壳、健康检查、日志与链路标识。
-**尚未接入 Huobao 反向代理，也尚未接入鉴权与限流**（见「当前范围」）。
+## 当前状态
+
+**P1 反代已打通。** 已完成：工程骨架、配置与契约、注册表、四类路由壳、healthz/readyz、
+slog JSON 日志与 W3C traceparent 透传、伪造头剥离、统一错误出口、
+**Nacos 服务发现（HTTP 开放 API）+ 随机权重负载均衡 + 灰度（version/tag）+ HTTP 反代**。
+
+尚未接入：鉴权与 JWT 签发（`authstub`）、限流计数、MCP 工具实现。
 
 ## 技术栈
 
@@ -104,44 +109,82 @@ go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --alway
 
 ```json
 {"time":"...","level":"INFO","msg":"request","request_id":"...","trace_id":"...","app_code":"huobao",
- "route":"web","method":"GET","downstream":"huobao","upstream_host":"127.0.0.1:5679","status":501,
- "code":50101,"latency_ms":1.23,"req_bytes":0,"resp_bytes":131,"principal_id":"","retry":0,"error_code":50101}
+ "route":"web","method":"GET","downstream":"huobao","upstream_host":"127.0.0.1:5679","status":200,
+ "code":0,"latency_ms":3.29,"req_bytes":0,"resp_bytes":76,"principal_id":"","retry":0,"error_code":0}
 ```
 
 - `X-Request-Id` 合法时透传，非法或缺失时重新生成（32 位十六进制），并写入响应头便于前端对照。
 - `traceparent` 按 W3C 规范解析，合法则沿用、否则生成新链路；缺失的标识不会导致请求被拒。
+- `resp_bytes`：流式响应取已声明的 `Content-Length`，未知长度记 `-1`。
+  日志中间件**绝不读取响应体**——读一次就会把流读干，导致客户端收到空响应。
 - **绝不记录** Authorization/Cookie 凭据、请求与响应正文。
 
 ## 目录结构
 
 ```
-cmd/server/            进程入口：配置加载、启动、信号与优雅退出
-internal/
-├── app/               装配层：中间件顺序、路由注册、协议层参数
-├── config/            环境变量解析与启动期校验
-├── contracts/         契约：错误码、错误响应体、请求头、上下文键、路由家族
-├── httpx/             基于 Hertz 上下文的读写工具与统一响应出口
-├── middleware/        恢复、追踪、日志、头部治理、体积限制 + 鉴权/范围/限流空位
-├── observability/     结构化日志与链路标识
-├── registry/          app_code 注册表
-└── transport/         协议层：四类家族路由壳 + 健康检查 + 兜底
+newx-gateway/
+├── go.mod / .gitignore / .env.example / README.md
+├── cmd/server/            进程入口：配置加载、启动、信号与优雅退出
+└── internal/
+    ├── app/               装配层：中间件顺序、路由注册、协议层参数
+    ├── config/            环境变量解析与启动期校验
+    ├── contracts/         契约：错误码、错误响应体、请求头、上下文键、路由家族
+    ├── discovery/         服务发现：静态地址 + Nacos 开放 API（缓存、降级、后台刷新）
+    ├── httpx/             基于 Hertz 上下文的读写工具与统一响应出口
+    ├── lb/                随机权重负载均衡与灰度筛选（version/tag）
+    ├── middleware/        恢复、追踪、日志、头部治理、体积限制 + 鉴权/范围/限流空位
+    ├── observability/     结构化日志与链路标识
+    ├── proxy/             下游 HTTP 转发：流式回写、错误码映射
+    ├── registry/          app_code 注册表（含上游路径改写）
+    └── transport/         协议层：四类家族路由壳 + 健康检查 + 兜底
 ```
 
 中间件顺序固定为 `Recover → Tracing → RequestLogger → HeaderGuard → BodyLimit → 家族中间件 → 处理器`，
 理由见 `internal/middleware` 包注释。
 
+## 转发与上游选择
+
+一次 `/web/huobao/v1/dramas` 请求的处理顺序：
+
+1. 从 URL 解析 `app_code`（不依赖框架路由参数，保证同一条规则同一种结果）；
+2. 查注册表，未注册直接 `40402`；
+3. `discovery` 解析实例列表：静态地址或 Nacos（拉取失败时降级用旧缓存，无缓存才 `50201`）；
+4. `lb.FilterGray` 按请求头 `version` / `tag` 筛选，无匹配则回退全量并打告警（语义与 yudao 网关一致）；
+5. `lb.Pick` 随机 + 权重选一个实例；
+6. 路径改写：剥掉家族前缀与版本段，拼上注册表里的上游路径前缀；
+7. `proxy.Forward` 转发并**流式**回写响应，不缓冲响应体。
+
+灰度请求头：`version: 2.0` 命中实例 `metadata.version=2.0`；`tag: my-host` 定向到打了同标签的实例。
+
+下游错误映射：拨号失败 → `50201`，超时 → `50401`，其它传输错误 → `50202`；
+下游自身的 4xx/5xx **原样透传**（客户端错误处理不被入口破坏），仅把 5xx 在日志里归类为 `50202`。
+
 ## 当前范围与后续接入点
 
-已交付：配置与契约、注册表、四类路由壳、健康检查、日志与链路、伪造头剥离、统一错误出口。
+已交付：配置与契约、注册表、四类路由壳、健康检查、日志与链路、伪造头剥离、统一错误出口、
+Nacos 服务发现、随机权重负载均衡、灰度筛选、HTTP 反代（含 Range/流式透传）。
 
 尚未交付（按依赖顺序）：
 
-1. **Huobao 反向代理**：新增 `internal/clients/huobao`，替换 `transport.FamilyModule` 中标注的「反代接入点」；
-   同时接入超时分级、错误映射（50201/50202/50401）、`/static` 的 Range 透传与大文件上传豁免。
-2. **鉴权与授权范围**：补齐 `middleware.Authenticator` 的 JWT 本地校验，打开 `ScopeGuard.SetEnabled(true)`。
+1. **鉴权与授权范围**：补齐 `middleware.Authenticator` 的 JWT 本地校验，打开 `ScopeGuard.SetEnabled(true)`。
    签发方优先使用内置 `authstub`（仅 dev/CI），后续替换为 Admin Service，入口只换配置不改代码。
-3. **限流**：在 `middleware.Limiter` 中按主体维度计数，超限返回 `42901` 与 `Retry-After`；
+   与 yudao 对接时还需要支持它约定的 `login-user`（JSON）与 `tenant-id` 请求头。
+2. **限流**：在 `middleware.Limiter` 中按主体维度计数，超限返回 `42901` 与 `Retry-After`；
    生成类额外受 `MAX_CONCURRENCY_GENERATE` 约束，超并发快速失败而非排队。
+3. **按请求类型细化超时**：当前预算按路由家族近似划分，待路由元数据就绪后细化为
+   读/写/生成/上传四类各自独立预算。
+
+## 开发
+
+```bash
+go build ./...    # 编译
+go vet ./...      # 静态检查
+go test ./...     # 单元测试 + 端到端冒烟（internal/app/app_test.go）
+```
+
+`internal/app/app_test.go` 会启动真实监听并在 127.0.0.1 上完整验证：健康检查、四类路由语义、
+未注册应用、关闭通道、伪造头剥离、反代转发与响应透传、上游路径改写、下游不可用、
+下游错误透传、Range 206、体积限制、请求标识透传与日志字段完整性。
 
 ## 开发
 

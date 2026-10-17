@@ -1,0 +1,264 @@
+// Package proxy 提供最小可用的下游 HTTP 转发。
+//
+// 边界：
+//   - 只做协议搬运：请求方法、路径、Query、请求头、请求体原样送上游；
+//   - 响应同样原样回写（状态码、响应头、流式响应体），不在入口缓冲或改写业务响应；
+//   - 只负责错误分类：拨号失败 → 50201，超时 → 50401，其它 → 50202。
+//
+// 刻意不引入 Hertz 的 HTTP 客户端：转发需要精确控制连接池、超时与流式拷贝，
+// 标准库 net/http 语义更直观，也便于用 httptest 做端到端测试。
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cloudwego/hertz/pkg/app"
+
+	"newx-gateway/internal/contracts"
+)
+
+// hopByHopHeaders 是逐跳头（RFC 7230 §6.1），转发时必须剔除，
+// 否则会把上游的连接语义错误地传递给客户端。
+var hopByHopHeaders = map[string]bool{
+	"connection":          true,
+	"proxy-connection":    true,
+	"keep-alive":          true,
+	"proxy-authenticate":  true,
+	"proxy-authorization": true,
+	"te":                  true,
+	"trailer":             true,
+	"transfer-encoding":   true,
+	"upgrade":             true,
+}
+
+// Options 是转发器的运行参数。
+type Options struct {
+	// DialTimeout 是建立连接的超时。拨号失败必须快速返回 50201，
+	// 不能占用路由的整体预算——否则下游宕机会把入口的线程/连接耗尽。
+	DialTimeout time.Duration
+	// Budgets 是按路由家族的整体超时预算；未命中家族使用 DefaultBudget。
+	Budgets map[string]time.Duration
+	// DefaultBudget 是默认整体超时。
+	DefaultBudget time.Duration
+	// MaxIdleConns 与 MaxIdleConnsPerHost 控制连接池，避免每个下游都新建连接。
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
+	// TrustProxyHeaders 决定是否写入 X-Forwarded-* 头。
+	// 只有入口前方确有可信代理时才开启，否则客户端可伪造来源 IP。
+	TrustProxyHeaders bool
+}
+
+// Target 是上游目标。
+type Target struct {
+	Scheme   string
+	Host     string
+	Path     string
+	RawQuery string
+}
+
+// URL 拼出完整上游地址。
+func (t Target) URL() string {
+	scheme := t.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	path := t.Path
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	url := scheme + "://" + t.Host + path
+	if t.RawQuery != "" {
+		url += "?" + t.RawQuery
+	}
+	return url
+}
+
+// Proxy 是转发器。
+type Proxy struct {
+	client *http.Client
+	opts   Options
+}
+
+// New 构建转发器。
+func New(opts Options) *Proxy {
+	dialTimeout := opts.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 2 * time.Second
+	}
+	maxIdle := opts.MaxIdleConns
+	if maxIdle <= 0 {
+		maxIdle = 256
+	}
+	maxIdlePerHost := opts.MaxIdleConnsPerHost
+	if maxIdlePerHost <= 0 {
+		maxIdlePerHost = 64
+	}
+
+	transport := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		MaxIdleConns:        maxIdle,
+		MaxIdleConnsPerHost: maxIdlePerHost,
+		IdleConnTimeout:     90 * time.Second,
+		// 响应头超时交由调用方通过 context 控制，这里不重复设置。
+		ResponseHeaderTimeout: 0,
+		DisableCompression:    true,
+	}
+
+	return &Proxy{
+		client: &http.Client{
+			Transport: transport,
+			// 不设 Timeout：整体预算由 Forward 中的 context 控制，
+			// 否则长耗时生成请求会被客户端级超时误杀。
+			Timeout: 0,
+		},
+		opts: opts,
+	}
+}
+
+// Error 是转发失败的结构化错误，携带应返回给客户端的错误码。
+type Error struct {
+	Code contracts.Code
+	Err  error
+}
+
+func (e *Error) Error() string { return e.Err.Error() }
+
+func (e *Error) Unwrap() error { return e.Err }
+
+// Forward 把当前请求转发到上游，并把响应原样写回。
+//
+// 约定：返回的 error 一定是 *Error，调用方据此取出错误码；
+// 响应已经开始写出时不会再改写状态码（此时仅登记错误码）。
+func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Target, family string) error {
+	budget := p.budget(family)
+	requestCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	body := rc.Request.Body()
+	// 注意：必须用 io.Reader 接口变量承载，不能直接传 *bytes.Reader——
+	// 传类型化空指针会让 http.NewRequestWithContext 误判为「有请求体」。
+	var requestBody io.Reader
+	if len(body) > 0 {
+		requestBody = bytes.NewReader(body)
+	}
+
+	request, err := http.NewRequestWithContext(requestCtx, string(rc.Method()), target.URL(), requestBody)
+	if err != nil {
+		return &Error{Code: contracts.CodeDownstreamBad, Err: err}
+	}
+
+	copyRequestHeaders(request, rc, p.opts.TrustProxyHeaders)
+
+	response, err := p.client.Do(request)
+	if err != nil {
+		return classify(err)
+	}
+
+	// 注意：不能在这里 defer response.Body.Close()。
+	// Hertz 是在处理器返回之后才读取 bodyStream 并写出的，提前关闭会让读取失败
+	// （http: read on closed response body），表现为连接被重置、客户端收到 EOF。
+	// 响应体的所有权在此移交给 Hertz：它会在读完数据后自动调用 Close。
+	writeResponse(rc, response)
+	return nil
+}
+
+// budget 返回该路由家族的整体超时。
+func (p *Proxy) budget(family string) time.Duration {
+	if budget, ok := p.opts.Budgets[family]; ok && budget > 0 {
+		return budget
+	}
+	if p.opts.DefaultBudget > 0 {
+		return p.opts.DefaultBudget
+	}
+	return 60 * time.Second
+}
+
+// copyRequestHeaders 复制请求头，剔除逐跳头与 Host。
+// Host 必须由 net/http 根据上游地址重新生成，透传会造成虚拟主机错乱。
+func copyRequestHeaders(request *http.Request, rc *app.RequestContext, trustProxyHeaders bool) {
+	rc.Request.Header.VisitAll(func(key, value []byte) {
+		name := strings.ToLower(string(key))
+		if hopByHopHeaders[name] || name == "host" || name == "content-length" {
+			return
+		}
+		request.Header.Add(string(key), string(value))
+	})
+
+	if trustProxyHeaders {
+		if clientIP := rc.ClientIP(); clientIP != "" {
+			request.Header.Set("X-Forwarded-For", clientIP)
+			request.Header.Set("X-Forwarded-Proto", "http")
+			request.Header.Set("X-Forwarded-Host", string(rc.Host()))
+		}
+	}
+}
+
+// writeResponse 原样回写上游响应。
+//
+// 响应体使用流式写出（SetBodyStream），不做整体缓冲：
+// 大文件、视频分段（Range 206）与长连接流式响应都不会被入口拖慢或占用内存。
+func writeResponse(rc *app.RequestContext, response *http.Response) {
+	rc.Response.Header.SetStatusCode(response.StatusCode)
+
+	for key, values := range response.Header {
+		name := strings.ToLower(key)
+		if hopByHopHeaders[name] || name == "content-length" {
+			continue
+		}
+		for _, value := range values {
+			rc.Response.Header.Add(key, value)
+		}
+	}
+
+	// Content-Length 由 Hertz 根据流大小自行处理；仅在已知长度时显式声明，
+	// 保证客户端进度条与 Range 请求行为一致。
+	size := -1
+	if response.ContentLength >= 0 {
+		size = int(response.ContentLength)
+		rc.Response.Header.Set("Content-Length", strconv.Itoa(size))
+	}
+	rc.SetBodyStream(response.Body, size)
+}
+
+func readerOrNil(reader *bytes.Reader) *bytes.Reader {
+	if reader == nil {
+		return nil
+	}
+	return reader
+}
+
+// classify 把传输层错误映射为入口错误码。
+func classify(err error) *Error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return &Error{Code: contracts.CodeDownstreamTimeout, Err: err}
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &Error{Code: contracts.CodeDownstreamTimeout, Err: err}
+	}
+
+	// 连接被拒、DNS 失败、无路由等「根本连不上」的归类为下游不可用。
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return &Error{Code: contracts.CodeDownstreamRefused, Err: err}
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return &Error{Code: contracts.CodeDownstreamRefused, Err: err}
+	}
+
+	return &Error{Code: contracts.CodeDownstreamBad, Err: err}
+}

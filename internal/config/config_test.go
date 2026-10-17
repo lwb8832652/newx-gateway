@@ -109,6 +109,90 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestLoadAppsWithUpstreamPathAndDiscovery(t *testing.T) {
+	cfg, err := LoadFrom(newLookup(map[string]string{
+		"APPS":      "huobao=http://127.0.0.1:5679|/api/v1,yudao-system=nacos://yudao-system|/admin-api/system",
+		"DISCOVERY": "nacos://127.0.0.1:8848",
+	}))
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+
+	if len(cfg.Apps) != 2 {
+		t.Fatalf("应用数 = %d，期望 2", len(cfg.Apps))
+	}
+
+	huobao := cfg.Apps[0]
+	if huobao.Code != "huobao" || huobao.BaseURL != "http://127.0.0.1:5679" || huobao.UpstreamPath != "/api/v1" {
+		t.Errorf("huobao 解析异常: %+v", huobao)
+	}
+
+	yudao := cfg.Apps[1]
+	if yudao.Service != "yudao-system" || yudao.BaseURL != "" || yudao.UpstreamPath != "/admin-api/system" {
+		t.Errorf("nacos 服务解析异常: %+v", yudao)
+	}
+}
+
+func TestLoadDiscovery(t *testing.T) {
+	cfg, err := LoadFrom(newLookup(map[string]string{
+		"APPS":                "yudao-system=nacos://yudao-system",
+		"DISCOVERY":           "nacos://127.0.0.1:8848",
+		"DISCOVERY_NAMESPACE": "ns-1",
+		"DISCOVERY_GROUP":     "MY_GROUP",
+		"DISCOVERY_REFRESH":   "10s",
+	}))
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+
+	if !cfg.Discovery.Enabled || cfg.Discovery.Addr != "127.0.0.1:8848" {
+		t.Errorf("Nacos 地址解析异常: %+v", cfg.Discovery)
+	}
+	if cfg.Discovery.Namespace != "ns-1" || cfg.Discovery.Group != "MY_GROUP" {
+		t.Errorf("命名空间/分组解析异常: %+v", cfg.Discovery)
+	}
+	if cfg.Discovery.Refresh != 10*time.Second {
+		t.Errorf("刷新周期 = %s，期望 10s", cfg.Discovery.Refresh)
+	}
+}
+
+func TestLoadRejectsNacosServiceWithoutDiscovery(t *testing.T) {
+	_, err := LoadFrom(newLookup(map[string]string{"APPS": "yudao-system=nacos://yudao-system"}))
+	if err == nil {
+		t.Fatal("使用 nacos:// 服务但未配置 DISCOVERY 必须报错")
+	}
+	if !strings.Contains(err.Error(), "DISCOVERY") {
+		t.Errorf("错误信息应指明缺少 DISCOVERY，实际: %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidDiscoveryAndApps(t *testing.T) {
+	cases := []struct {
+		name   string
+		env    map[string]string
+		expect string
+	}{
+		{"DISCOVERY 协议错误", map[string]string{"DISCOVERY": "consul://127.0.0.1:8500"}, "DISCOVERY"},
+		{"DISCOVERY 地址无端口", map[string]string{"DISCOVERY": "nacos://127.0.0.1"}, "DISCOVERY"},
+		{"DISCOVERY 刷新周期非法", map[string]string{"DISCOVERY": "nacos://127.0.0.1:8848", "DISCOVERY_REFRESH": "10"}, "DISCOVERY_REFRESH"},
+		// huobao 有默认地址兜底，因此用其它编码验证「无下游来源」的校验。
+		{"应用无下游来源", map[string]string{"APPS": "novel"}, "既无静态地址"},
+		{"上游路径不以斜杠开头", map[string]string{"APPS": "huobao=http://127.0.0.1:5679|api/v1"}, "上游路径"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadFrom(newLookup(tc.env))
+			if err == nil {
+				t.Fatalf("期望报错，实际加载成功")
+			}
+			if !strings.Contains(err.Error(), tc.expect) {
+				t.Errorf("错误信息 %q 未包含 %q", err.Error(), tc.expect)
+			}
+		})
+	}
+}
+
 func TestProductionRejectsAuthStub(t *testing.T) {
 	_, err := LoadFrom(newLookup(map[string]string{
 		"ENTRY_ENV":         EnvProduction,

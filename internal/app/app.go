@@ -13,14 +13,19 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"newx-gateway/internal/config"
+	"newx-gateway/internal/contracts"
+	"newx-gateway/internal/discovery"
 	"newx-gateway/internal/middleware"
+	"newx-gateway/internal/proxy"
 	"newx-gateway/internal/registry"
 	"newx-gateway/internal/transport"
 	"newx-gateway/internal/transport/admin"
@@ -37,9 +42,10 @@ type App struct {
 	Logger   *slog.Logger
 	Registry *registry.Registry
 
-	scopeGuard *middleware.ScopeGuard
-	limiter    *middleware.Limiter
-	modules    []string
+	scopeGuard    *middleware.ScopeGuard
+	limiter       *middleware.Limiter
+	modules       []string
+	discoveryStop context.CancelFunc
 }
 
 // New 构建入口服务。任何装配失败都会返回错误，由进程入口以非零码退出。
@@ -49,6 +55,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	}
 
 	reg, err := registry.New(registry.SpecsFromConfig(cfg.Apps))
+	if err != nil {
+		return nil, err
+	}
+
+	resolver, discoveryStop, err := buildResolver(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +118,13 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 
 	healthModule := health.New(cfg.Version, cfg.Env, cfg.ReadyzProbeDownstream, downstreams(cfg))
 
-	deps := transport.Deps{Config: cfg, Registry: reg, Logger: logger}
+	deps := transport.Deps{
+		Config:    cfg,
+		Registry:  reg,
+		Logger:    logger,
+		Discovery: resolver,
+		Proxy:     proxy.New(proxyOptions(cfg)),
+	}
 	modules := transport.Register(h, deps,
 		webModule, adminModule, mcpModule, openAPIModule, healthModule,
 	)
@@ -118,13 +135,14 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	h.NoMethod(fallback)
 
 	return &App{
-		Hertz:      h,
-		Config:     cfg,
-		Logger:     logger,
-		Registry:   reg,
-		scopeGuard: scopeGuard,
-		limiter:    limiter,
-		modules:    modules,
+		Hertz:         h,
+		Config:        cfg,
+		Logger:        logger,
+		Registry:      reg,
+		scopeGuard:    scopeGuard,
+		limiter:       limiter,
+		modules:       modules,
+		discoveryStop: discoveryStop,
 	}, nil
 }
 
@@ -132,7 +150,12 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 func (a *App) Run() error { return a.Hertz.Run() }
 
 // Shutdown 优雅停止接收新请求并等待在途请求结束。
-func (a *App) Shutdown(ctx context.Context) error { return a.Hertz.Shutdown(ctx) }
+func (a *App) Shutdown(ctx context.Context) error {
+	if a.discoveryStop != nil {
+		a.discoveryStop()
+	}
+	return a.Hertz.Shutdown(ctx)
+}
 
 // Modules 返回已注册的路由模块名，用于启动日志与自检。
 func (a *App) Modules() []string {
@@ -181,4 +204,95 @@ func downstreams(cfg *config.Config) []health.Downstream {
 		result = append(result, health.Downstream{AppCode: item.Code, BaseURL: item.BaseURL})
 	}
 	return result
+}
+
+// buildResolver 构建服务解析器：静态地址与 Nacos 发现按应用共存。
+//
+// 返回的取消函数用于停止 Nacos 后台刷新协程，由 Shutdown 调用。
+func buildResolver(cfg *config.Config, logger *slog.Logger) (discovery.Resolver, context.CancelFunc, error) {
+	multi := discovery.NewMulti()
+
+	staticAddresses := make(map[string][]string)
+	nacosServices := make([]string, 0, len(cfg.Apps))
+	for _, app := range cfg.Apps {
+		if app.Service != "" {
+			nacosServices = append(nacosServices, app.Service)
+			continue
+		}
+		if address := hostPortOf(app.BaseURL); address != "" {
+			staticAddresses[app.Code] = append(staticAddresses[app.Code], address)
+		}
+	}
+
+	if len(staticAddresses) > 0 {
+		staticResolver, err := discovery.NewStaticResolver(staticAddresses)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, service := range staticResolver.Services() {
+			multi.Add(service, staticResolver)
+		}
+	}
+
+	if len(nacosServices) > 0 {
+		if !cfg.Discovery.Enabled {
+			return nil, nil, fmt.Errorf("APPS 使用了 nacos:// 服务，但 DISCOVERY 未配置")
+		}
+		nacosResolver, err := discovery.NewNacosResolver(discovery.NacosConfig{
+			Addr:      cfg.Discovery.Addr,
+			Namespace: cfg.Discovery.Namespace,
+			Group:     cfg.Discovery.Group,
+			Refresh:   cfg.Discovery.Refresh,
+			Logger:    logger,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, service := range nacosServices {
+			multi.Add(service, nacosResolver)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		nacosResolver.Start(ctx)
+		return multi, cancel, nil
+	}
+
+	return multi, nil, nil
+}
+
+// proxyOptions 依据配置构造转发参数。
+//
+// 预算按路由家族近似划分：生成类与上传类请求可能持续数分钟到数十分钟，
+// 因此 Web 家族取写入/生成/上传三类的最大值，避免长请求被误杀。
+// 待路由元数据就绪后，这里会细化到「读/写/生成/上传」四类请求各自独立预算。
+func proxyOptions(cfg *config.Config) proxy.Options {
+	return proxy.Options{
+		DialTimeout: 2 * time.Second,
+		Budgets: map[string]time.Duration{
+			contracts.FamilyWeb:     maxDuration(cfg.Timeouts.Write, cfg.Timeouts.Generate, cfg.Timeouts.Upload),
+			contracts.FamilyAdmin:   cfg.Timeouts.Write,
+			contracts.FamilyMCP:     cfg.Timeouts.MCP,
+			contracts.FamilyOpenAPI: cfg.Timeouts.Write,
+		},
+		DefaultBudget:       cfg.Timeouts.Write,
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 64,
+		TrustProxyHeaders:   cfg.TrustProxyHeaders,
+	}
+}
+
+// hostPortOf 提取 URL 的主机部分（host:port）。
+func hostPortOf(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	slash := strings.Index(rawURL, "://")
+	if slash < 0 {
+		return ""
+	}
+	rest := rawURL[slash+3:]
+	if at := strings.IndexAny(rest, "/?#"); at >= 0 {
+		rest = rest[:at]
+	}
+	return rest
 }

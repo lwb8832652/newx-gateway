@@ -20,6 +20,10 @@ const (
 	CtxErrMsg = "newx.err_msg"
 	// CtxRateBucket 记录本次请求命中的限流分桶，供日志与排障使用。
 	CtxRateBucket = "newx.rate_bucket"
+	// CtxDownstreamErrorCode 记录下游响应产生的错误归类（例如下游 5xx 归一为 50202），
+	// 与入口自身产生的 CtxErrorCode 分开：透传下游响应时入口并未失败，
+	// 但错误码归类仍需要能反映这次请求失败了。
+	CtxDownstreamErrorCode = "newx.downstream_error_code"
 )
 
 // 路由家族标识。与 URL 前缀一一对应，供限流分桶、日志归类与后续按家族鉴权使用。
