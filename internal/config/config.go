@@ -59,7 +59,13 @@ const (
 	DefaultTrustProxyHeaders   = false
 	DefaultAuthStubEnabled     = false
 	DefaultDiscoveryRefresh    = 5 * time.Second
-	appCodePattern             = `^[a-z][a-z0-9-]{1,31}$`
+	DefaultBreakerEnabled      = true
+	DefaultBreakerThreshold    = 5
+	DefaultBreakerCooldown     = 10 * time.Second
+	// DefaultGeneratePaths 与 DefaultUploadPaths 对应设计文档 §6 的预算分类。
+	DefaultGeneratePaths = "/agent,/tasks,/merge,/previs,/task-queue"
+	DefaultUploadPaths   = "/upload"
+	appCodePattern       = `^[a-z][a-z0-9-]{1,31}$`
 )
 
 var appCodeRe = regexp.MustCompile(appCodePattern)
@@ -88,6 +94,27 @@ type Discovery struct {
 	Group string
 	// Refresh 是后台刷新周期，同时作为本地缓存的 TTL。
 	Refresh time.Duration
+}
+
+// Breaker 是失败实例熔断配置。
+//
+// 作用：某个实例连续失败达到阈值后，在冷却期内不再被选中，
+// 避免坏实例持续拖慢请求（静态地址场景尤其重要，因为没有注册中心的健康检查）。
+type Breaker struct {
+	Enabled          bool
+	FailureThreshold int
+	Cooldown         time.Duration
+}
+
+// TimeoutRules 用路径片段把请求分类到不同的超时预算。
+//
+// 设计文档 §6 的四级预算（读/写/生成/上传）需要知道请求类型，
+// 而入口不做业务路由登记，因此用可配置的路径片段匹配来近似分类。
+type TimeoutRules struct {
+	// GeneratePaths 命中则按生成类预算（默认 15min）。
+	GeneratePaths []string
+	// UploadPaths 命中则按上传类预算（默认 30min）。
+	UploadPaths []string
 }
 
 // Timeouts 是按路由类别划分的超时预算。
@@ -123,6 +150,9 @@ type Config struct {
 	OpenAPIEnabled bool
 
 	Discovery Discovery
+
+	Breaker      Breaker
+	TimeoutRules TimeoutRules
 
 	AuthIssuerBaseURL string
 	AuthStubEnabled   bool
@@ -225,6 +255,15 @@ func parse(lookup func(string) (string, bool)) (*Config, error) {
 	}
 	cfg.Discovery = discovery
 
+	cfg.Breaker = Breaker{
+		Enabled:          reader.boolean("BREAKER_ENABLED", DefaultBreakerEnabled, &errs),
+		FailureThreshold: reader.int("BREAKER_FAIL_THRESHOLD", DefaultBreakerThreshold, &errs),
+		Cooldown:         reader.duration("BREAKER_COOLDOWN", DefaultBreakerCooldown, &errs),
+	}
+
+	generatePaths, uploadPaths := parsePathRules(reader)
+	cfg.TimeoutRules = TimeoutRules{GeneratePaths: generatePaths, UploadPaths: uploadPaths}
+
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
@@ -311,6 +350,26 @@ func parseApps(reader envReader) ([]AppConfig, error) {
 	return apps, nil
 }
 
+// parsePathRules 解析超时分类的路径片段规则。
+// 空串表示使用默认规则；条目需以 / 开头，否则视为配置错误。
+func parsePathRules(reader envReader) (generate, upload []string) {
+	generate = splitPathList(reader.str("TIMEOUT_GENERATE_PATHS", DefaultGeneratePaths))
+	upload = splitPathList(reader.str("TIMEOUT_UPLOAD_PATHS", DefaultUploadPaths))
+	return generate, upload
+}
+
+func splitPathList(raw string) []string {
+	items := strings.Split(raw, ",")
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
 // Validate 执行启动期校验。任何失败都必须让进程无法启动。
 func (c *Config) Validate() error {
 	var errs []error
@@ -388,6 +447,21 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.Breaker.Enabled {
+		if c.Breaker.FailureThreshold <= 0 {
+			errs = append(errs, fmt.Errorf("BREAKER_FAIL_THRESHOLD 必须为正数: %d", c.Breaker.FailureThreshold))
+		}
+		if c.Breaker.Cooldown <= 0 {
+			errs = append(errs, fmt.Errorf("BREAKER_COOLDOWN 必须为正数: %s", c.Breaker.Cooldown))
+		}
+	}
+	if err := validatePathRules("TIMEOUT_GENERATE_PATHS", c.TimeoutRules.GeneratePaths); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validatePathRules("TIMEOUT_UPLOAD_PATHS", c.TimeoutRules.UploadPaths); err != nil {
+		errs = append(errs, err)
+	}
+
 	if c.AuthIssuerBaseURL != "" {
 		if err := validateDownstreamURL(c.AuthIssuerBaseURL); err != nil {
 			errs = append(errs, fmt.Errorf("AUTH_ISSUER_BASE_URL 非法: %w", err))
@@ -414,6 +488,19 @@ func (c *Config) Validate() error {
 
 // IsValidAppCode 校验应用编码格式。注册表与应用配置共用同一规则，避免两处漂移。
 func IsValidAppCode(code string) bool { return appCodeRe.MatchString(code) }
+
+// validatePathRules 校验超时分类路径片段：非空且以 / 开头。
+func validatePathRules(name string, paths []string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("%s 至少需要一个路径片段", name)
+	}
+	for _, path := range paths {
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("%s 片段 %q 需以 / 开头", name, path)
+		}
+	}
+	return nil
+}
 
 func validateListenAddr(addr string) error {
 	if strings.TrimSpace(addr) == "" {

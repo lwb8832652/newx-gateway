@@ -19,9 +19,10 @@ import (
 	"newx-gateway/internal/transport"
 )
 
-// probeTimeout 是单个下游探测的超时预算。就绪检查必须快速返回，
-// 否则部署平台会先超时，再得到一个无意义的错误。
-const probeTimeout = 2 * time.Second
+// Prober 探测下游是否可达。由转发器实现，从而复用同一套连接池与超时设置。
+type Prober interface {
+	Probe(ctx context.Context, baseURL string) error
+}
 
 // Module 是健康检查模块。
 type Module struct {
@@ -29,6 +30,8 @@ type Module struct {
 	Env              string
 	ProbeDownstream  bool
 	CheckDownstreams []Downstream
+	// Prober 为空时跳过下游探测（就绪检查只反映自身状态）。
+	Prober Prober
 }
 
 // Downstream 是被探测的下游目标。
@@ -38,12 +41,13 @@ type Downstream struct {
 }
 
 // New 依据配置构造健康检查模块。
-func New(version, env string, probeDownstream bool, downstreams []Downstream) Module {
+func New(version, env string, probeDownstream bool, downstreams []Downstream, prober Prober) Module {
 	return Module{
 		Version:          version,
 		Env:              env,
 		ProbeDownstream:  probeDownstream,
 		CheckDownstreams: downstreams,
+		Prober:           prober,
 	}
 }
 
@@ -135,11 +139,18 @@ func (m Module) probeAll(ctx context.Context) []ReadyCheck {
 
 		go func(index int, target string) {
 			defer func() { done <- struct{}{} }()
-			reachable, err := probe(ctx, target)
-			checks[index].Reachable = reachable
-			if err != nil {
-				checks[index].Error = err.Error()
+			if m.Prober == nil {
+				// 没有可用的探测实现时不谎报不可达，只标记为未知。
+				checks[index].Reachable = true
+				checks[index].Error = "prober unavailable"
+				return
 			}
+			if err := m.Prober.Probe(ctx, target); err != nil {
+				checks[index].Reachable = false
+				checks[index].Error = err.Error()
+				return
+			}
+			checks[index].Reachable = true
 		}(index, downstream.BaseURL)
 	}
 
@@ -147,24 +158,4 @@ func (m Module) probeAll(ctx context.Context) []ReadyCheck {
 		<-done
 	}
 	return checks
-}
-
-// probe 探测目标是否可达。只关心「能否建立并完成一次 HTTP 交互」，
-// 不把下游的 4xx/5xx 判定为不可达——那是下游的业务状态，不是连通性。
-func probe(ctx context.Context, baseURL string) (bool, error) {
-	requestCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
-
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, baseURL, nil)
-	if err != nil {
-		return false, err
-	}
-
-	client := &http.Client{Timeout: probeTimeout}
-	response, err := client.Do(request)
-	if err != nil {
-		return false, err
-	}
-	defer response.Body.Close()
-	return true, nil
 }

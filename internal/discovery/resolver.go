@@ -50,6 +50,10 @@ func NewStaticResolver(addresses map[string][]string) (*StaticResolver, error) {
 }
 
 // Resolve 实现 Resolver。
+//
+// 返回的切片是解析器内部缓存的直接引用（零拷贝）：实例在整条链路上只读，
+// 每个请求都深拷贝一遍会让热路径白白产生大量 map 分配。
+// 调用方不得修改返回值或其 Metadata。
 func (s *StaticResolver) Resolve(_ context.Context, service string) ([]Instance, error) {
 	if s == nil {
 		return nil, fmt.Errorf("静态解析器未初始化")
@@ -58,7 +62,7 @@ func (s *StaticResolver) Resolve(_ context.Context, service string) ([]Instance,
 	if !ok {
 		return nil, fmt.Errorf("服务 %q 未配置静态地址", service)
 	}
-	return cloneInstances(instances), nil
+	return instances, nil
 }
 
 // Services 返回已配置的服务名，按字典序排列。

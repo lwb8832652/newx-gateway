@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -380,6 +382,213 @@ func TestProxyPassesThroughDownstreamError(t *testing.T) {
 	}
 	if !found {
 		t.Error("缺少 Web 家族的请求日志")
+	}
+}
+
+// TestProxyStreamsLargeRequestBody 验证大请求体不再整体读进内存：
+// 入口以流式转发，上游应完整收到数 MB 的请求体。
+func TestProxyStreamsLargeRequestBody(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 6<<20) // 6MB
+	var received int64
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		received = n
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"received":` + strconv.FormatInt(n, 10) + `}`))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		// 上传路径命中上传档，避免被读/写预算掐断。
+		cfg.TimeoutRules = config.TimeoutRules{GeneratePaths: []string{"/agent"}, UploadPaths: []string{"/upload"}}
+	})
+
+	response, body := env.do(t, requestOptions{
+		method: http.MethodPost,
+		path:   "/web/huobao/v1/upload",
+		body:   string(payload),
+	})
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200，响应 %s", response.StatusCode, body)
+	}
+	if received != int64(len(payload)) {
+		t.Errorf("上游收到 %d 字节，期望 %d（流式转发丢数据）", received, len(payload))
+	}
+	if !strings.Contains(string(body), strconv.FormatInt(int64(len(payload)), 10)) {
+		t.Errorf("响应体异常: %s", body)
+	}
+}
+
+// TestProxyPreservesPathEncoding 验证路径中的百分号编码被原样透传。
+func TestProxyPreservesPathEncoding(t *testing.T) {
+	var gotPath, gotRawPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotRawPath = r.URL.EscapedPath()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+	})
+
+	// 含中文与 %2F 的路径：解码后转发会导致下游路径匹配错位。
+	env.do(t, requestOptions{path: "/web/huobao/v1/dramas/%E4%B8%AD%E6%96%87"})
+
+	if gotRawPath != "/api/v1/dramas/%E4%B8%AD%E6%96%87" {
+		t.Errorf("上游收到转义路径 %q，期望 %q（编码未被保留）", gotRawPath, "/api/v1/dramas/%E4%B8%AD%E6%96%87")
+	}
+	if gotPath != "/api/v1/dramas/中文" {
+		t.Errorf("上游解码路径 = %q，期望 %q", gotPath, "/api/v1/dramas/中文")
+	}
+}
+
+// TestProxyRetriesIdempotentRequests 验证幂等请求在传输层失败后会重试一次。
+func TestProxyRetriesIdempotentRequests(t *testing.T) {
+	var attempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			// 首次请求直接掐断连接，模拟连接级抖动。
+			if hijacker, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hijacker.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"attempt":"second"}`))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+	})
+
+	response, body := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（重试未生效），响应 %s", response.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "second") {
+		t.Errorf("应使用重试后的响应，实际 %s", body)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("上游被请求 %d 次，期望 2（一次失败 + 一次重试）", got)
+	}
+}
+
+// TestProxyDoesNotRetryNonIdempotentRequests 验证写方法不自动重试。
+func TestProxyDoesNotRetryNonIdempotentRequests(t *testing.T) {
+	var attempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		if hijacker, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hijacker.Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+	})
+
+	response, _ := env.do(t, requestOptions{
+		method: http.MethodPost,
+		path:   "/web/huobao/v1/dramas",
+		body:   `{"name":"x"}`,
+	})
+	if response.StatusCode == http.StatusOK {
+		t.Fatal("写方法失败时不应重试成功")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("上游被请求 %d 次，期望 1（写方法不得自动重试）", got)
+	}
+}
+
+// TestProxyUploadChannelExemptFromBodyLimit 验证上传通道不受普通体积上限约束。
+func TestProxyUploadChannelExemptFromBodyLimit(t *testing.T) {
+	var received int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		received = n
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		// 普通通道只有 1KB，上传通道 64MB。
+		cfg.MaxBodyBytes = 1024
+		cfg.MaxBodyBytesUpload = 64 << 20
+		cfg.TimeoutRules = config.TimeoutRules{GeneratePaths: []string{"/agent"}, UploadPaths: []string{"/upload"}}
+	})
+
+	payload := strings.Repeat("y", 8192)
+
+	// 普通路径：超出 1KB 必须被拒。
+	response, body := env.do(t, requestOptions{
+		method: http.MethodPost,
+		path:   "/web/huobao/v1/dramas",
+		body:   payload,
+	})
+	if response.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("普通路径状态码 = %d，期望 413", response.StatusCode)
+	}
+	if decoded := decodeError(t, body); decoded.Code != int(contracts.CodeBodyTooLarge) {
+		t.Errorf("错误码 = %d，期望 %d", decoded.Code, contracts.CodeBodyTooLarge)
+	}
+
+	// 上传路径：同样大小必须放行并完整转发。
+	response, _ = env.do(t, requestOptions{
+		method: http.MethodPost,
+		path:   "/web/huobao/v1/upload",
+		body:   payload,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("上传路径状态码 = %d，期望 200（上传通道未被豁免）", response.StatusCode)
+	}
+	if received != int64(len(payload)) {
+		t.Errorf("上游收到 %d 字节，期望 %d", received, len(payload))
+	}
+}
+
+// TestProxyCircuitBreakerStopsHammeringFailedDownstream 验证下游持续 5xx 时熔断生效。
+func TestProxyCircuitBreakerStopsHammeringFailedDownstream(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		// 阈值 2：两次 5xx 后打开熔断。
+		cfg.Breaker = config.Breaker{Enabled: true, FailureThreshold: 2, Cooldown: time.Minute}
+	})
+
+	for i := 0; i < 4; i++ {
+		response, _ := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"})
+		if response.StatusCode != http.StatusInternalServerError && response.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("第 %d 次请求状态码 = %d", i+1, response.StatusCode)
+		}
+	}
+
+	// 前两次真正打到下游，之后被熔断拦下，不再继续发送。
+	if got := hits.Load(); got != 2 {
+		t.Errorf("下游被请求 %d 次，期望 2（熔断后应停止发送）", got)
 	}
 }
 
@@ -757,6 +966,16 @@ func testConfig(t *testing.T, mutate func(*config.Config)) *config.Config {
 		},
 		LogLevel:  "debug",
 		LogFormat: config.LogFormatJSON,
+
+		Breaker: config.Breaker{
+			Enabled:          config.DefaultBreakerEnabled,
+			FailureThreshold: config.DefaultBreakerThreshold,
+			Cooldown:         config.DefaultBreakerCooldown,
+		},
+		TimeoutRules: config.TimeoutRules{
+			GeneratePaths: []string{"/agent", "/tasks", "/merge", "/previs", "/task-queue"},
+			UploadPaths:   []string{"/upload"},
+		},
 	}
 
 	if mutate != nil {

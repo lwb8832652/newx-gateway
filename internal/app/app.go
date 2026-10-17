@@ -24,6 +24,7 @@ import (
 	"newx-gateway/internal/config"
 	"newx-gateway/internal/contracts"
 	"newx-gateway/internal/discovery"
+	"newx-gateway/internal/lb"
 	"newx-gateway/internal/middleware"
 	"newx-gateway/internal/proxy"
 	"newx-gateway/internal/registry"
@@ -67,6 +68,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	h := server.New(
 		server.WithHostPorts(cfg.HTTPAddr),
 		server.WithExitWaitTime(cfg.ExitWaitTime),
+		// 请求体改为流式：大文件上传不再整体读进内存，由转发层直接搬运字节。
+		// 注意这会改变 Body() 的语义（返回已缓冲部分），因此反代必须使用 BodyStream()。
+		server.WithStreamBody(true),
 		// 协议层体积上限与中间件的语义层校验构成两道防线，分工不同：
 		//   - 协议层用「上传通道上限」兜底，避免恶意超大 body 被读入内存；
 		//   - 语义层（middleware.BodyLimit）按普通通道上限给出统一的 40002 错误体。
@@ -88,7 +92,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		middleware.Tracing(),
 		middleware.RequestLogger(logger),
 		middleware.HeaderGuard(),
-		middleware.BodyLimit(cfg.MaxBodyBytes),
+		middleware.BodyLimit(cfg.MaxBodyBytes, cfg.TimeoutRules.UploadPaths, cfg.MaxBodyBytesUpload),
 	)
 
 	// 家族级中间件：鉴权 → 范围校验 → 限流。本阶段三者均为空位（恒放行），
@@ -116,14 +120,23 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	openAPIModule := openapi.New(cfg.OpenAPIEnabled)
 	openAPIModule.Middlewares = familyChain(middleware.BucketOpenAPI)
 
-	healthModule := health.New(cfg.Version, cfg.Env, cfg.ReadyzProbeDownstream, downstreams(cfg))
+	proxyClient := proxy.New(proxyOptions(cfg))
+
+	var breaker *lb.Breaker
+	if cfg.Breaker.Enabled {
+		breaker = lb.NewBreaker(cfg.Breaker.FailureThreshold, cfg.Breaker.Cooldown)
+	}
+
+	// 就绪检查复用转发器的连接池，避免每个探测都新建客户端。
+	healthModule := health.New(cfg.Version, cfg.Env, cfg.ReadyzProbeDownstream, downstreams(cfg), proxyClient)
 
 	deps := transport.Deps{
 		Config:    cfg,
 		Registry:  reg,
 		Logger:    logger,
 		Discovery: resolver,
-		Proxy:     proxy.New(proxyOptions(cfg)),
+		Proxy:     proxyClient,
+		Breaker:   breaker,
 	}
 	modules := transport.Register(h, deps,
 		webModule, adminModule, mcpModule, openAPIModule, healthModule,
@@ -262,19 +275,22 @@ func buildResolver(cfg *config.Config, logger *slog.Logger) (discovery.Resolver,
 
 // proxyOptions 依据配置构造转发参数。
 //
-// 预算按路由家族近似划分：生成类与上传类请求可能持续数分钟到数十分钟，
-// 因此 Web 家族取写入/生成/上传三类的最大值，避免长请求被误杀。
-// 待路由元数据就绪后，这里会细化到「读/写/生成/上传」四类请求各自独立预算。
+// 预算分两级：
+//   - 家族级覆盖（family:*）：MCP 等通道有独立严格预算，优先于请求类型；
+//   - 请求类型档位（read/write/generate/upload）：设计文档 §6 的四级预算。
 func proxyOptions(cfg *config.Config) proxy.Options {
 	return proxy.Options{
 		DialTimeout: 2 * time.Second,
 		Budgets: map[string]time.Duration{
-			contracts.FamilyWeb:     maxDuration(cfg.Timeouts.Write, cfg.Timeouts.Generate, cfg.Timeouts.Upload),
-			contracts.FamilyAdmin:   cfg.Timeouts.Write,
-			contracts.FamilyMCP:     cfg.Timeouts.MCP,
-			contracts.FamilyOpenAPI: cfg.Timeouts.Write,
+			proxy.KindRead:                      cfg.Timeouts.Read,
+			proxy.KindWrite:                     cfg.Timeouts.Write,
+			proxy.KindGenerate:                  cfg.Timeouts.Generate,
+			proxy.KindUpload:                    cfg.Timeouts.Upload,
+			"family:" + contracts.FamilyMCP:     cfg.Timeouts.MCP,
+			"family:" + contracts.FamilyOpenAPI: cfg.Timeouts.Write,
 		},
 		DefaultBudget:       cfg.Timeouts.Write,
+		Rules:               proxy.BudgetRules{GeneratePaths: cfg.TimeoutRules.GeneratePaths, UploadPaths: cfg.TimeoutRules.UploadPaths},
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 64,
 		TrustProxyHeaders:   cfg.TrustProxyHeaders,

@@ -99,6 +99,9 @@ func (n *NacosResolver) Start(ctx context.Context) {
 
 // Resolve 实现 Resolver。
 //
+// 返回的切片为内部缓存的直接引用（零拷贝）：实例在链路上只读。
+// 缓存写入时会自行拷贝一次，因此这里的零拷贝不会让调用方看到半成品数据。
+//
 // 缓存未过期直接返回；已过期或缺失则立即拉取。拉取失败时：
 //   - 有旧缓存 → 返回旧缓存（宁可流量打到已知实例，也不要整体失败）；
 //   - 无缓存 → 返回错误，由调用方映射为 50201。
@@ -113,20 +116,20 @@ func (n *NacosResolver) Resolve(ctx context.Context, service string) ([]Instance
 	n.mu.RUnlock()
 
 	if ok && (ttl <= 0 || time.Since(entry.fetchedAt) < ttl) {
-		return cloneInstances(entry.instances), nil
+		return entry.instances, nil
 	}
 
 	instances, err := n.fetch(ctx, service)
 	if err != nil {
 		if ok {
 			// 拉取失败但存在旧缓存：降级使用旧数据。
-			return cloneInstances(entry.instances), nil
+			return entry.instances, nil
 		}
 		return nil, err
 	}
 
 	n.store(service, instances)
-	return cloneInstances(instances), nil
+	return instances, nil
 }
 
 // Refresh 刷新缓存中的全部服务。缓存为空时不做任何事。
@@ -217,10 +220,12 @@ func (n *NacosResolver) fetch(ctx context.Context, service string) ([]Instance, 
 	return instances, nil
 }
 
+// store 写入缓存。入参来自本次拉取，所有权转交给缓存，
+// 因此这里拷贝一份，避免调用方后续修改影响缓存内容。
 func (n *NacosResolver) store(service string, instances []Instance) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.cache[service] = cacheEntry{instances: cloneInstances(instances), fetchedAt: time.Now()}
+	n.cache[service] = cacheEntry{instances: append([]Instance(nil), instances...), fetchedAt: time.Now()}
 }
 
 // Services 返回当前已缓存的服务名。

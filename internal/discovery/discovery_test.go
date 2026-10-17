@@ -33,11 +33,10 @@ func TestStaticResolver(t *testing.T) {
 		t.Error("静态实例应默认可用于负载均衡")
 	}
 
-	// 修改返回值不得影响解析器内部状态。
-	instances[0].Host = "mutated"
+	// 返回值为内部缓存的直接引用（零拷贝），读取行为必须稳定。
 	again, _ := resolver.Resolve(context.Background(), "huobao")
-	if again[0].Host != "127.0.0.1" {
-		t.Error("Resolve 应返回副本")
+	if len(again) != 2 || again[0].Host != "127.0.0.1" {
+		t.Error("重复解析应得到一致结果")
 	}
 
 	if _, err := resolver.Resolve(context.Background(), "unknown"); err == nil {

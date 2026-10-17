@@ -17,8 +17,39 @@ import (
 )
 
 // Pick 随机 + 权重地选取一个可用实例。
+//
+// 使用 math/rand 的包级函数：内部是并发安全的全局源，无分配，
+// 适合热路径；需要可复现的结果时用 PickWith 注入独立随机源。
 func Pick(instances []discovery.Instance) (discovery.Instance, bool) {
-	return PickWith(rand.New(rand.NewSource(randSeed())), instances)
+	usable := usableInstances(instances)
+	if len(usable) == 0 {
+		return discovery.Instance{}, false
+	}
+
+	total := 0.0
+	for _, instance := range usable {
+		if weight := instance.Weight; weight > 0 {
+			total += weight
+		}
+	}
+
+	// 全部实例权重都为 0 时退化为均摊随机，避免除零与永远选不到实例。
+	if total <= 0 {
+		return usable[rand.Intn(len(usable))], true
+	}
+
+	target := rand.Float64() * total
+	accumulated := 0.0
+	for _, instance := range usable {
+		if weight := instance.Weight; weight > 0 {
+			accumulated += weight
+		}
+		if target < accumulated {
+			return instance, true
+		}
+	}
+	// 浮点累加误差兜底：返回最后一个可用实例。
+	return usable[len(usable)-1], true
 }
 
 // PickWith 使用指定随机源选取实例，便于测试复现。
@@ -35,7 +66,6 @@ func PickWith(rnd *rand.Rand, instances []discovery.Instance) (discovery.Instanc
 		}
 	}
 
-	// 全部实例权重都为 0 时退化为均摊随机，避免除零与永远选不到实例。
 	if total <= 0 {
 		return usable[rnd.Intn(len(usable))], true
 	}
@@ -50,7 +80,6 @@ func PickWith(rnd *rand.Rand, instances []discovery.Instance) (discovery.Instanc
 			return instance, true
 		}
 	}
-	// 浮点累加误差兜底：返回最后一个可用实例。
 	return usable[len(usable)-1], true
 }
 
@@ -101,12 +130,15 @@ func FilterGray(instances []discovery.Instance, version, tag string) ([]discover
 	return filtered, restored
 }
 
-// usableInstances 过滤出可参与负载均衡的实例，并返回副本。
+// usableInstances 过滤出可参与负载均衡的实例。
+//
+// 只做结构体值拷贝，不深拷贝 Metadata：Metadata 在整条链路上只读，
+// 深拷贝会让每个请求都为每个实例分配一个 map，热路径上纯属浪费。
 func usableInstances(instances []discovery.Instance) []discovery.Instance {
 	usable := make([]discovery.Instance, 0, len(instances))
 	for _, instance := range instances {
 		if instance.Usable() {
-			usable = append(usable, instance.Clone())
+			usable = append(usable, instance)
 		}
 	}
 	return usable

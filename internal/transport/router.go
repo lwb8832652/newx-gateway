@@ -36,6 +36,8 @@ type Deps struct {
 	Discovery discovery.Resolver
 	// Proxy 负责把请求转发到选中的实例。
 	Proxy *proxy.Proxy
+	// Breaker 记录实例失败并临时摘除坏实例；为空表示不启用熔断。
+	Breaker *lb.Breaker
 }
 
 // Module 是一个可注册的路由模块。
@@ -106,7 +108,9 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 		// 应用编码与剩余路径一律从 URL 解析，不依赖路由参数：
 		// 框架的通配参数在不同路径形态下取值不一致，而入口路径规则是自己定的，
 		// 自己解析才能保证「同一条规则、同一种结果」。
-		appCode, rest := splitAppCode(m.Prefix, string(c.Path()), m.Versioned)
+		// 同时必须使用原始（仍带百分号编码）路径，否则含中文或 %2F 的 URL
+		// 会被解码后重新编码，导致下游路径匹配错位。
+		appCode, rest := splitAppCode(m.Prefix, originalPath(c), m.Versioned)
 		if appCode == "" {
 			httpx.WriteError(c, contracts.CodeRouteNotFound)
 			return
@@ -154,22 +158,26 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 			)
 		}
 
-		chosen, ok := lb.Pick(candidates)
-		if !ok {
-			httpx.WriteError(c, contracts.CodeDownstreamRefused)
-			return
+		// 摘除熔断中的实例。全部实例都处于熔断状态时直接快速失败：
+		// 继续把请求发给已知故障的下游只会白占连接、拖慢客户端，
+		// 而熔断冷却结束后 Allow 会自动放行试探请求，流量自行恢复。
+		if deps.Breaker != nil {
+			available := deps.Breaker.Available(candidates)
+			if len(available) == 0 {
+				httpx.WriteError(c, contracts.CodeDownstreamRefused)
+				return
+			}
+			candidates = available
 		}
 
-		c.Set(contracts.CtxUpstreamHost, chosen.Address())
-
 		target := proxy.Target{
-			Scheme:   chosen.Scheme,
-			Host:     chosen.Address(),
+			Scheme:   candidates[0].Scheme,
+			Host:     candidates[0].Address(),
 			Path:     joinPath(registered.UpstreamPath, rest),
 			RawQuery: string(c.Request.URI().QueryString()),
 		}
 
-		if err := deps.Proxy.Forward(ctx, c, target, m.Family); err != nil {
+		if err := m.forward(ctx, deps, c, target, candidates); err != nil {
 			var proxyErr *proxy.Error
 			if errors.As(err, &proxyErr) {
 				httpx.WriteError(c, proxyErr.Code)
@@ -180,11 +188,108 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 		}
 
 		// 下游 5xx：响应体仍原样透传（客户端的错误处理不被入口破坏），
-		// 但错误码归类记为 50202，供日志与告警识别。
-		if c.Response.StatusCode() >= 500 {
+		// 但错误码归类记为 50202，供日志与告警识别；
+		// 同时计入实例失败，让熔断器能把持续报错的下游摘掉。
+		upstream := httpx.String(c, contracts.CtxUpstreamHost)
+		switch {
+		case c.Response.StatusCode() >= 500:
 			c.Set(contracts.CtxDownstreamErrorCode, int(contracts.CodeDownstreamBad))
+			if upstream != "" {
+				deps.Breaker.RecordFailure(upstream)
+			}
+		case upstream != "":
+			deps.Breaker.RecordSuccess(upstream)
 		}
 	}
+}
+
+// forward 执行转发，并在必要时重试。
+//
+// 重试策略（设计文档 §9）：
+//   - 仅幂等方法（GET/HEAD/OPTIONS）可重试，且最多 1 次；
+//   - 仅传输层失败（拨号失败 50201、超时 50401）可重试，此时响应尚未开始写出，
+//     重试不会产生重复响应；
+//   - 重试必须换一个实例，否则只是把同样的失败再演一遍；
+//   - 写方法与生成类请求一律不自动重试，由客户端带幂等键自行决定。
+func (m FamilyModule) forward(ctx context.Context, deps Deps, c *app.RequestContext, target proxy.Target, candidates []discovery.Instance) error {
+	maxAttempts := 1
+	if isIdempotent(string(c.Method())) {
+		maxAttempts = 2
+	}
+
+	excluded := make(map[string]bool)
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		chosen, ok := pickExcluding(candidates, excluded)
+		if !ok {
+			break
+		}
+
+		target.Scheme = chosen.Scheme
+		target.Host = chosen.Address()
+		c.Set(contracts.CtxUpstreamHost, chosen.Address())
+
+		lastErr = deps.Proxy.Forward(ctx, c, target, m.Family)
+
+		if lastErr != nil {
+			// 传输层失败：记入实例失败，供熔断器摘除。
+			deps.Breaker.RecordFailure(chosen.Address())
+		}
+
+		var proxyErr *proxy.Error
+		if !errors.As(lastErr, &proxyErr) {
+			return lastErr
+		}
+		// 只有「根本连不上」和「超时」值得换实例再试一次；
+		// 下游已给出响应（含错误响应）时不重试。
+		if proxyErr.Code != contracts.CodeDownstreamRefused && proxyErr.Code != contracts.CodeDownstreamTimeout {
+			return lastErr
+		}
+		if attempt >= maxAttempts {
+			break
+		}
+		excluded[chosen.Address()] = true
+	}
+
+	return lastErr
+}
+
+// isIdempotent 报告该方法是否可安全重试。
+func isIdempotent(method string) bool {
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD", "OPTIONS":
+		return true
+	default:
+		return false
+	}
+}
+
+// pickExcluding 从候选集中选一个未被排除的实例。
+//
+// 若排除后没有剩余实例（单实例部署的常见情况），回退到全量候选集：
+// 连接级抖动往往重连一次就能恢复，此时「换实例」没有意义，
+// 但不重试又会把瞬时失败直接暴露给客户端。
+func pickExcluding(candidates []discovery.Instance, excluded map[string]bool) (discovery.Instance, bool) {
+	remaining := make([]discovery.Instance, 0, len(candidates))
+	for _, instance := range candidates {
+		if excluded[instance.Address()] {
+			continue
+		}
+		remaining = append(remaining, instance)
+	}
+	if len(remaining) == 0 {
+		remaining = candidates
+	}
+	return lb.Pick(remaining)
+}
+
+// originalPath 返回客户端原始请求路径（保留百分号编码）。
+func originalPath(c *app.RequestContext) string {
+	if raw := c.Request.URI().PathOriginal(); len(raw) > 0 {
+		return string(raw)
+	}
+	return string(c.Path())
 }
 
 // splitAppCode 从请求路径中解析应用编码与剩余路径。

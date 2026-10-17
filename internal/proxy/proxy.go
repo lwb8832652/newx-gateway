@@ -13,11 +13,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -48,6 +50,8 @@ type Options struct {
 	Budgets map[string]time.Duration
 	// DefaultBudget 是默认整体超时。
 	DefaultBudget time.Duration
+	// Rules 决定请求被归入哪一档预算（读/写/生成/上传）。
+	Rules BudgetRules
 	// MaxIdleConns 与 MaxIdleConnsPerHost 控制连接池，避免每个下游都新建连接。
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
@@ -90,25 +94,25 @@ type Proxy struct {
 	opts   Options
 }
 
-// New 构建转发器。
+// New 构建转发器。零值字段一律回落到默认值，避免调用方漏配导致行为不确定。
 func New(opts Options) *Proxy {
-	dialTimeout := opts.DialTimeout
-	if dialTimeout <= 0 {
-		dialTimeout = 2 * time.Second
+	if opts.DialTimeout <= 0 {
+		opts.DialTimeout = 2 * time.Second
 	}
-	maxIdle := opts.MaxIdleConns
-	if maxIdle <= 0 {
-		maxIdle = 256
+	if opts.MaxIdleConns <= 0 {
+		opts.MaxIdleConns = 256
 	}
-	maxIdlePerHost := opts.MaxIdleConnsPerHost
-	if maxIdlePerHost <= 0 {
-		maxIdlePerHost = 64
+	if opts.MaxIdleConnsPerHost <= 0 {
+		opts.MaxIdleConnsPerHost = 64
+	}
+	if opts.DefaultBudget <= 0 {
+		opts.DefaultBudget = 60 * time.Second
 	}
 
 	transport := &http.Transport{
-		DialContext:         (&net.Dialer{Timeout: dialTimeout}).DialContext,
-		MaxIdleConns:        maxIdle,
-		MaxIdleConnsPerHost: maxIdlePerHost,
+		DialContext:         (&net.Dialer{Timeout: opts.DialTimeout}).DialContext,
+		MaxIdleConns:        opts.MaxIdleConns,
+		MaxIdleConnsPerHost: opts.MaxIdleConnsPerHost,
 		IdleConnTimeout:     90 * time.Second,
 		// 响应头超时交由调用方通过 context 控制，这里不重复设置。
 		ResponseHeaderTimeout: 0,
@@ -141,22 +145,24 @@ func (e *Error) Unwrap() error { return e.Err }
 // 约定：返回的 error 一定是 *Error，调用方据此取出错误码；
 // 响应已经开始写出时不会再改写状态码（此时仅登记错误码）。
 func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Target, family string) error {
-	budget := p.budget(family)
+	method := string(rc.Method())
+	path := target.Path
+	budget := p.budget(family, method, path)
 	requestCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	body := rc.Request.Body()
-	// 注意：必须用 io.Reader 接口变量承载，不能直接传 *bytes.Reader——
-	// 传类型化空指针会让 http.NewRequestWithContext 误判为「有请求体」。
-	var requestBody io.Reader
-	if len(body) > 0 {
-		requestBody = bytes.NewReader(body)
-	}
-
-	request, err := http.NewRequestWithContext(requestCtx, string(rc.Method()), target.URL(), requestBody)
+	requestBody, contentLength, err := requestBodyOf(rc)
 	if err != nil {
 		return &Error{Code: contracts.CodeDownstreamBad, Err: err}
 	}
+
+	request, err := http.NewRequestWithContext(requestCtx, method, target.URL(), requestBody)
+	if err != nil {
+		return &Error{Code: contracts.CodeDownstreamBad, Err: err}
+	}
+	// 流式请求体不会自带 Content-Length，必须显式声明，否则会退化成 chunked，
+	// 部分下游不接受分块上传。
+	request.ContentLength = contentLength
 
 	copyRequestHeaders(request, rc, p.opts.TrustProxyHeaders)
 
@@ -173,9 +179,47 @@ func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Targ
 	return nil
 }
 
-// budget 返回该路由家族的整体超时。
-func (p *Proxy) budget(family string) time.Duration {
-	if budget, ok := p.opts.Budgets[family]; ok && budget > 0 {
+// Probe 探测目标地址是否可达，供就绪检查复用同一个连接池。
+// 只关心「能否完成一次 HTTP 交互」，不把 4xx/5xx 判为不可达。
+func (p *Proxy) Probe(ctx context.Context, baseURL string) error {
+	if p == nil || baseURL == "" {
+		return fmt.Errorf("探测目标为空")
+	}
+
+	requestCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, baseURL, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/json")
+
+	response, err := p.client.Do(request)
+	if err != nil {
+		return err
+	}
+	// 探测不关心响应内容，直接丢弃并关闭。
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return nil
+}
+
+// probeTimeout 是单个探测的超时预算：就绪检查必须快速返回，
+// 否则部署平台会先超时，再得到一个无意义的错误。
+const probeTimeout = 2 * time.Second
+
+// budget 返回该请求的整体超时。
+//
+// 取值顺序（从具体到宽泛）：
+//  1. 家族级覆盖：MCP 等通道有独立严格预算，不该被请求类型放宽；
+//  2. 请求类型档位：read/write/generate/upload；
+//  3. 默认值。
+func (p *Proxy) budget(family, method, path string) time.Duration {
+	if budget, ok := p.opts.Budgets[budgetFamilyKey(family)]; ok && budget > 0 {
+		return budget
+	}
+	if budget, ok := p.opts.Budgets[KindOf(method, path, p.opts.Rules)]; ok && budget > 0 {
 		return budget
 	}
 	if p.opts.DefaultBudget > 0 {
@@ -183,6 +227,9 @@ func (p *Proxy) budget(family string) time.Duration {
 	}
 	return 60 * time.Second
 }
+
+// budgetFamilyKey 是家族级预算的键，加前缀以和请求类型档位区分开。
+func budgetFamilyKey(family string) string { return "family:" + family }
 
 // copyRequestHeaders 复制请求头，剔除逐跳头与 Host。
 // Host 必须由 net/http 根据上游地址重新生成，透传会造成虚拟主机错乱。
@@ -197,11 +244,20 @@ func copyRequestHeaders(request *http.Request, rc *app.RequestContext, trustProx
 
 	if trustProxyHeaders {
 		if clientIP := rc.ClientIP(); clientIP != "" {
-			request.Header.Set("X-Forwarded-For", clientIP)
+			// 多级代理时必须追加而不是覆盖，否则会丢掉上游代理已经记录的链路。
+			request.Header.Set("X-Forwarded-For", appendForwardedFor(request.Header.Get("X-Forwarded-For"), clientIP))
 			request.Header.Set("X-Forwarded-Proto", "http")
 			request.Header.Set("X-Forwarded-Host", string(rc.Host()))
 		}
 	}
+}
+
+// appendForwardedFor 按 RFC 7239 语义把新地址追加到已有链之后。
+func appendForwardedFor(existing, clientIP string) string {
+	if existing == "" {
+		return clientIP
+	}
+	return existing + ", " + clientIP
 }
 
 // writeResponse 原样回写上游响应。
@@ -238,19 +294,46 @@ func readerOrNil(reader *bytes.Reader) *bytes.Reader {
 	return reader
 }
 
+// requestBodyOf 取出要转发给上游的请求体。
+//
+// 优先使用流式请求体：大文件上传若先整体读进内存，单请求就能吃掉 GB 级堆内存。
+// 只有非流式（已被 Hertz 缓冲）时才回退到内存副本。
+//
+// 返回值第二个字段是内容长度；-1 表示长度未知，交给上游按 chunked 处理。
+func requestBodyOf(rc *app.RequestContext) (io.Reader, int64, error) {
+	declared := int64(rc.Request.Header.ContentLength())
+
+	if rc.Request.IsBodyStream() {
+		stream := rc.Request.BodyStream()
+		if stream == nil {
+			return nil, 0, fmt.Errorf("请求体流为空")
+		}
+		return stream, declared, nil
+	}
+
+	body := rc.Request.Body()
+	if len(body) == 0 {
+		// 注意：必须返回接口类型的 nil。直接返回 *bytes.Reader 的类型化空指针，
+		// 会让 http.NewRequestWithContext 误判为「有请求体」并发出 Content-Length: 0 的请求体。
+		return nil, 0, nil
+	}
+	return bytes.NewReader(body), int64(len(body)), nil
+}
+
 // classify 把传输层错误映射为入口错误码。
 func classify(err error) *Error {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
+	// 整体预算耗尽。
+	if errors.Is(err, context.DeadlineExceeded) {
 		return &Error{Code: contracts.CodeDownstreamTimeout, Err: err}
 	}
 
+	// 传输层超时（含 DNS 超时）。
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return &Error{Code: contracts.CodeDownstreamTimeout, Err: err}
 	}
 
-	// 连接被拒、DNS 失败、无路由等「根本连不上」的归类为下游不可用。
+	// 「根本连不上」的各类形态：连接被拒、DNS 失败、无路由。
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
 		return &Error{Code: contracts.CodeDownstreamRefused, Err: err}
@@ -260,5 +343,33 @@ func classify(err error) *Error {
 		return &Error{Code: contracts.CodeDownstreamRefused, Err: err}
 	}
 
+	// 连接建立后被对端关闭、或写入中途被重置：同样属于「连不上」，
+	// 值得按幂等重试一次，因此也归为下游不可用而不是笼统的响应异常。
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return &Error{Code: contracts.CodeDownstreamRefused, Err: err}
+	}
+	var resetErr *net.OpError
+	if errors.As(err, &resetErr) && isConnectionReset(resetErr) {
+		return &Error{Code: contracts.CodeDownstreamRefused, Err: err}
+	}
+	if isConnectionReset(err) {
+		return &Error{Code: contracts.CodeDownstreamRefused, Err: err}
+	}
+
 	return &Error{Code: contracts.CodeDownstreamBad, Err: err}
+}
+
+// isConnectionReset 判断错误链中是否包含连接重置。
+func isConnectionReset(err error) bool {
+	for ; err != nil; err = errors.Unwrap(err) {
+		if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EPIPE) {
+			return true
+		}
+		if opErr, ok := err.(*net.OpError); ok {
+			if errors.Is(opErr.Err, syscall.ECONNRESET) || errors.Is(opErr.Err, syscall.EPIPE) {
+				return true
+			}
+		}
+	}
+	return false
 }
