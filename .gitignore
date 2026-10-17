@@ -1,0 +1,20 @@
+# 编译产物
+/bin/
+/dist/
+newx-gateway
+*.exe
+
+# 测试与覆盖率
+*.out
+coverage.html
+
+# 本地环境变量（含密钥，切勿提交；示例见 .env.example）
+.env
+.env.local
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+
+# 注意：本仓库不忽略 *.md，文档需要被跟踪
