@@ -1,4 +1,4 @@
-// Package auth 实现与 yudao-cloud 网关完全一致的认证方式。
+// Package auth 对齐 yudao-cloud 的身份传递契约，授权由下游决定。
 //
 // yudao-gateway 的 TokenAuthenticationFilter 做法（源码核实）：
 //   - 读取 Authorization: Bearer <token>，无 token 直接放行，不拦截；
@@ -7,7 +7,7 @@
 //     tenant-id 单独一个头；
 //   - 校验失败或过期同样放行，由下游服务自行判断接口是否需要登录。
 //
-// 这里 1:1 复刻该行为，包括 login-user 头的字段名与编码方式——
+// 本包沿用 login-user 头的字段名与编码方式，不声称逐项复刻 Java 实现——
 // 它是芋道框架的私有约定（定义在 yudao-spring-boot-starter-security），
 // 不是 OAuth2/OIDC 标准，字段或编码差一点，下游就解析不出身份。
 package auth
@@ -44,11 +44,18 @@ func (u *LoginUser) Expired(now time.Time) bool {
 
 // HeaderValue 返回写入 login-user 头的值：JSON 序列化后再 URL-encode。
 //
-// 时间格式固定为 `2006-01-02T15:04:05`：与 Jackson 对 LocalDateTime 的
-// 默认输出一致（ISO 本地时间，不带时区后缀）。带时区后缀会导致下游
-// 反序列化失败，身份静默丢失。
+// expiresTime 使用 JSON 数字毫秒时间戳，与 yudao 注册的
+// TimestampLocalDateTimeSerializer/Deserializer 一致，而非 Jackson 默认 ISO 格式。
 func (u *LoginUser) HeaderValue() (string, error) {
-	payload, err := json.Marshal(u.normalized())
+	normalized := u.normalized()
+	payload, err := json.Marshal(struct {
+		ID          int64             `json:"id"`
+		UserType    int               `json:"userType"`
+		Info        map[string]string `json:"info"`
+		TenantID    int64             `json:"tenantId"`
+		Scopes      []string          `json:"scopes"`
+		ExpiresTime int64             `json:"expiresTime"`
+	}{normalized.ID, normalized.UserType, normalized.Info, normalized.TenantID, normalized.Scopes, normalized.ExpiresTime.UnixMilli()})
 	if err != nil {
 		return "", err
 	}
@@ -75,13 +82,22 @@ func ParseLoginUser(headerValue string) (*LoginUser, error) {
 		return nil, err
 	}
 	var user LoginUser
-	if err := json.Unmarshal([]byte(decoded), &user); err != nil {
+	var wire struct {
+		*LoginUser
+		ExpiresTime json.RawMessage `json:"expiresTime"`
+	}
+	wire.LoginUser = &user
+	if err := json.Unmarshal([]byte(decoded), &wire); err != nil {
+		return nil, err
+	}
+	user.ExpiresTime, err = parseJSONExpiresTime(wire.ExpiresTime)
+	if err != nil {
 		return nil, err
 	}
 	return &user, nil
 }
 
-// FormatExpiresTime 按 yudao 的 Jackson 默认格式输出过期时间。
+// FormatExpiresTime 仅用于人类可读的本地时间显示，不是 yudao 的传输格式。
 func FormatExpiresTime(value time.Time) string {
 	return value.Format("2006-01-02T15:04:05")
 }

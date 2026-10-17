@@ -1,7 +1,7 @@
 # newx-gateway
 
 统一入口（API Gateway）工程。目标是为 Web、Admin、MCP、OpenAPI 四类调用方提供唯一的入口边界：
-路由、鉴权、限流、超时、协议适配、日志与链路追踪都在这里收敛，业务能力由下游服务提供。
+路由、身份解析、超时、日志与链路追踪在这里收敛，业务能力与权限判断由下游服务提供。
 
 ## 当前状态
 
@@ -11,7 +11,8 @@ slog JSON 日志与 W3C traceparent 透传、伪造头剥离、统一错误出�
 按请求类型的超时分级、失败熔断、幂等重试、
 **认证（yudao 方式：远程校验 + `login-user` 头注入 + 本地缓存）**。
 
-尚未接入：限流计数与拦截、MCP 工具实现。
+当前范围不包括限流/生成并发控制、网关业务授权、MCP 工具实现及 OpenAPI 签名防重放。
+`ScopeGuard` 保持关闭；MCP 当前仅转发，OpenAPI 默认关闭。
 
 ## 技术栈
 
@@ -52,8 +53,8 @@ go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --alway
 | --- | --- | --- | --- |
 | `/web/{app_code}/v1/*` | Web、Electron | `login-user`/`tenant-id` 头注入，是否拦截由下游决定 | 校验 app_code 后转发下游 |
 | `/admin/{app_code}/v1/*` | 管理后台 | 同上（yudao 服务自带 RBAC） | 校验 app_code 后转发下游 |
-| `/mcp/{app_code}/*` | MCP Client | 独立凭证 + 工具白名单 + 严格超时 | 启用时转发；禁用时返回 `40401` |
-| `/open-api/{app_code}/v1/*` | 外部系统 | API Client + 签名 + 防重放 + 配额 | **默认关闭**，返回 `40401` |
+| `/mcp/{app_code}/*` | MCP Client | 同上身份解析 + MCP 超时；工具授权由下游负责 | 启用时转发；禁用时返回 `40401` |
+| `/open-api/{app_code}/v1/*` | 外部系统 | 当前未实现独立签名、防重放及配额 | **默认关闭**，返回 `40401` |
 | `/healthz` `/readyz` | 运维 | 无 | 见「健康检查」 |
 | 其他 | — | 无 | 兜底返回 `40401` |
 
@@ -85,7 +86,9 @@ go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --alway
 ## 健康检查
 
 - `GET /healthz`：**永不探测下游**。下游抖动导致入口实例被摘除，会把局部故障放大为整体故障。
-- `GET /readyz`：默认只反映自身状态；`READYZ_PROBE_DOWNSTREAM=true` 时探测已注册下游，任一不可达则返回 `503` 且 `status=degraded`。
+- `GET /readyz`：默认只反映自身状态；`READYZ_PROBE_DOWNSTREAM=true` 时复用解析器和连接池探测静态/Nacos 应用。
+  每个应用预算 2s，任一可用实例能完成 HTTP 交互即可；无实例、解析失败或全部不可达时返回 `503`、`status=degraded`。
+  探测只验证连通性，HTTP 4xx/5xx 不等同不可达；Nacos 降级缓存仍可参与探测，不代表注册中心当前健康。
 
 ## 配置
 
@@ -94,16 +97,64 @@ go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --alway
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `ENTRY_HTTP_ADDR` | `:8080` | 监听地址 |
-| `ENTRY_ENV` | `dev` | `dev` / `production` / `test`；生产环境禁止开启签发桩 |
+| `ENTRY_ENV` | `dev` | `dev` / `production` / `test` |
 | `APPS` | `huobao=http://127.0.0.1:5679` | 应用注册表，`code=base_url`，逗号分隔 |
 | `MCP_ENABLED` / `OPENAPI_ENABLED` | `true` / `false` | 通道开关 |
 | `MAX_BODY_BYTES` | 1048576 | 普通请求体上限（语义层返回 `40002`） |
 | `MAX_BODY_BYTES_UPLOAD` | 2147483648 | 协议层兜底上限 |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | 日志级别与格式 |
 | `READYZ_PROBE_DOWNSTREAM` | `false` | 就绪检查是否探测下游 |
-| `TIMEOUT_*` / `RATE_*` | 见示例 | **已解析并校验，尚未参与转发**（反代阶段启用） |
+| `AUTH_ENABLED` | `false` | 开启 yudao 方式身份解析；来源及超时配置见示例 |
+| `TIMEOUT_READ` / `TIMEOUT_WRITE` / `TIMEOUT_GENERATE` / `TIMEOUT_UPLOAD` / `TIMEOUT_MCP` | 见示例 | 已参与转发，请求预算覆盖响应流读取 |
+| `TIMEOUT_STATIC` | `300s` | 预留，当前没有独立静态通道分类 |
+| `RATE_*` / `MAX_CONCURRENCY_GENERATE` | 见示例 | 仅解析校验，按当前需求暂不执行限流或并发拦截 |
 
 配置在启动时一次性加载并校验：任何非法值都会打印全部错误并以退出码 `2` 退出，不做静默降级。
+
+### Nacos 服务发现
+
+`DISCOVERY` 填注册中心 `nacos://host:port`，不带控制台的 `/nacos` 路径；
+`APPS` 中的 `nacos://service-name` 则填已注册的服务名，允许与应用编码不同。
+以下是独立测试配置示例，地址和服务名需替换为自己的环境：
+
+```dotenv
+DISCOVERY=nacos://nacos.example.internal:8848
+DISCOVERY_NAMESPACE=
+DISCOVERY_GROUP=NEWX_GATEWAY_SMOKE
+DISCOVERY_REFRESH=1s
+APPS=smoke=nacos://newx-smoke|/api/v1
+READYZ_PROBE_DOWNSTREAM=true
+AUTH_ENABLED=false
+```
+
+- 命名空间填 **ID**，留空表示 `public`；分组留空表示 `DEFAULT_GROUP`。
+- `DISCOVERY_REFRESH` 同时是后台刷新间隔和缓存 TTL，默认 `5s`；`1s` 仅为本次测试值。
+  拉取失败时保留旧缓存，但成功获取空实例列表会覆盖旧缓存。
+- 网关仅通过 `/nacos/v1/ns/instance/list` 读取 HTTP 实例列表，不自动注册业务服务，
+  也不使用 Nacos SDK/gRPC。实例必须由业务服务或部署流程注册，地址必须能从网关访问。
+- 当前未实现 Nacos 用户名/密码登录、accessToken 获取或续期，也没有相应凭据配置项。
+  本次联调环境接口鉴权关闭，未发送凭据；开启 Nacos 鉴权后的对接尚未验证。
+  **不要为兼容当前实现而将无鉴权 Nacos 暴露到公网**，应先做好可信网络隔离。
+
+### 真实 Nacos 联调记录（2026-10-17）
+
+环境：远端 **Nacos 2.4.0**（standalone、MySQL），`public` 命名空间、独立临时分组，
+本地真实网关进程及两个临时 HTTP 后端；`AUTH_ENABLED=false`，刷新间隔 `1s`。
+
+| 场景 | 结果 |
+| --- | --- |
+| Nacos 存活与就绪 | 均为 HTTP 200 |
+| 无实例 | 网关 `/readyz` 为 503，业务请求为 HTTP 503 / `50201` |
+| 注册一个实例 | 自动发现并转发，`/readyz` 和业务请求均为 200；应用编码与服务名不同仍正常，路径和查询参数保留 |
+| 注册两个实例 | 24 次请求分别到 A/B：11/13 次；仅证明两实例均参与转发，不是负载均衡统计验收 |
+| 版本元数据 | `version: v1` 命中 A，`version: v2` 命中 B |
+| 禁用 A | 后续 8 次请求全部到 B |
+| 注销全部实例 | 缓存刷新后恢复 503 / `50201`，后端仍存活，证明不再使用旧实例 |
+| 清理 | 测试实例、远端测试服务已删除，本地测试进程已停止；测试分组服务数为 0 |
+
+本次结果为 **PASS**，没有改动已有业务服务、项目代码或持久配置。
+这是“真实 Nacos + 真实网关 + 本地测试后端”，不是模拟 Nacos 测试；
+但**不证明真实 Huobao/yudao 服务注册、登录/刷新/失效链路、Nacos 故障降级或生产性能通过**。
 
 ## 可观测性
 
@@ -179,8 +230,9 @@ newx-gateway/
 - **熔断**：实例连续失败达到 `BREAKER_FAIL_THRESHOLD` 后进入 `BREAKER_COOLDOWN` 冷却期，
   期间不参与选取；冷却结束自动放行一个试探请求，成功即恢复、失败则重新冷却。
   传输层失败与下游 5xx 都计入失败。
-- **重试**：仅幂等方法（`GET`/`HEAD`/`OPTIONS`）在拨号失败或超时时重试，最多 1 次，
-  优先换实例（单实例时重试同一实例）。写方法与生成类请求不自动重试。
+- **重试**：当前仅按方法判断，`GET`/`HEAD`/`OPTIONS` 在拨号失败或超时时最多换实例重试 1 次；
+  没有其他可用实例时不再重试。写方法不自动重试。
+  **已知缺口**：尚未排除生成类路径上的 GET 等方法，“生成类一律不重试”是目标而非当前保证。
 
 ### 错误映射
 
@@ -193,31 +245,40 @@ newx-gateway/
 | 体积超限（普通与上传通道各有上限） | `40002` |
 
 下游自身的 4xx/5xx **原样透传**（客户端错误处理不被入口破坏），仅在日志里归类为 `50202`。
+以上传输错误码只用于响应开始前；已开始回写的流不能改成 504 或再追加错误 JSON。
+流中超时会取消上游并结束传输。Hertz v0.10.6 对未知长度 chunked 的读错误可能写正常结束块，
+因此客户端收到部分内容后不一定能从 HTTP EOF 区分成功与截断；SSE/任务协议需用业务完成事件确认。
+当前默认 netpoll 传输已开启客户端断开感知，可取消仍在读取的上游请求；切换传输实现时须重新验证。
 
 ## 认证（沿用 yudao-cloud 网关方式）
 
-完全复刻 yudao-gateway 的 `TokenAuthenticationFilter` 行为，不做本地 JWT 校验：
+沿用 yudao-gateway 的身份传递与下游授权模式，不做本地 JWT 校验：
 
 ```
-请求 → 剥离客户端伪造的 login-user / tenant-id 头
-     → 无 Bearer Token？直接放行（不注入任何身份头）
-     → 有 Token → 查本地缓存（TTL 默认 1 分钟，含负缓存，合并并发请求）
-               → 未命中调 check-token 接口换取 LoginUser
-     → 有效 → 注入 login-user（LoginUser JSON + URL-encode）与 tenant-id 头
-     → 无效 / 已过期 / 鉴权方不可用 → 放行但不带身份
+请求 → 剥离客户端 login-user，规范化非负整数 tenant-id（仅租户选择提示）
+     → 无 Bearer Token？保留合法租户提示、不带身份放行
+     → 有 Token → 按租户提示 + Token 查缓存（TTL 默认 1 分钟，含负缓存、并发合并）
+               → 未命中调 check-token，带原租户提示
+     → 有效 → 注入 login-user（JSON + URL-encode），用返回 tenantId 覆盖 tenant-id
+     → 无效 / 已过期 / 鉴权方不可用 → 保留合法租户提示、不带身份放行
 ```
 
 **关键点**：
 
-- `login-user` 是**芋道框架的私有头**（定义在 `yudao-spring-boot-starter-security`），
-  不是 OAuth2/OIDC 标准。字段必须与 yudao 的 `LoginUser` 完全一致：
-  `id`/`userType`/`info`/`tenantId`/`scopes`/`expiresTime`；
-  时间格式固定 `2006-01-02T15:04:05`（对应 Jackson 对 `LocalDateTime` 的默认输出）。
-- **网关不拦截**：是否需要登录、有没有权限，全部由下游服务判断。
-  这与「入口做 JWT + Scope 校验」是两条不同的路线，选这条就意味着权限判断下沉。
-- 鉴权方可用 `AUTH_APP_CODE`（走注册表，支持 `nacos://` 服务发现）或 `AUTH_BASE_URL`（静态地址）。
-- 鉴权方不可用时**按无身份放行**：入口不因为认证链路抖动变成单点。
-- 客户端伪造的 `login-user`/`tenant-id` 一律剥离，否则可以冒充 admin 身份穿透到下游。
+- `login-user` 是**芋道框架的私有头**，不是 OAuth2/OIDC 标准。字段与 yudao 的 `LoginUser` 对齐：
+  `id`/`userType`/`info`/`tenantId`/`scopes`/`expiresTime`。
+  yudao 的网关和 Web starter 都注册了自定义 Jackson 时间序列化器，
+  `expiresTime` 实际是 **JSON 数字 epoch 毫秒时间戳**，不是默认 ISO 字符串。
+  check-token 同样支持数字毫秒；为兼容已有对接，仍接受带时区及本地时间字符串，
+  其中无时区字符串按 Go 进程本地时区解释。
+- **网关不做业务授权**：是否需要登录、有没有权限，由下游服务判断；`ScopeGuard` 不启用。
+- 鉴权方用 `AUTH_APP_CODE`（APPS 应用编码，可映射不同的 Nacos 服务名）或 `AUTH_BASE_URL`（静态 HTTP/HTTPS 地址），二选一。
+- `tenant-id` 是客户端可选的不可信租户提示，不能据此判断用户身份；无 Token 的登录接口也能使用它。
+  非法、负数及溢出值会被删除，显式 `0` 与未提供租户分别处理；有效身份以 check-token 的租户结果覆盖该头。
+- 本地正/负缓存共用 10000 项容量上限，写入时限频清理过期项，达到容量时淘汰任意一项，
+  避免一次性失效 Token 永久堆积；这是缓存内存管理，不是请求限流。
+- 客户端 `login-user` 始终剥离，仅从有效校验结果重建；鉴权方不可用时不携带身份放行，
+  所以下游必须自行保护需要登录的接口，且不应向公网开放可直接伪造身份头的访问路径。
 
 ## 当前范围与后续接入点
 
@@ -226,13 +287,24 @@ Nacos 服务发现、随机权重负载均衡、灰度筛选、HTTP 反代（流
 按请求类型的超时分级、失败熔断、幂等重试、上传通道体积豁免、
 认证（yudao 方式：远程校验 + `login-user` 头注入 + 本地缓存）。
 
-尚未交付（按依赖顺序）：
+当前明确不做：
 
-1. **限流**：在 `middleware.Limiter` 中按主体维度计数，超限返回 `42901` 与 `Retry-After`；
-   生成类额外受 `MAX_CONCURRENCY_GENERATE` 约束，超并发快速失败而非排队。
-2. **授权范围（可选）**：yudao 方式下权限判断默认下沉到下游服务；
-   若某条路由必须在入口拦截，可启用 `ScopeGuard`（规则与分桶能力已就绪）。
-3. **MCP 工具白名单**：`transport/mcp` 路由壳已就绪，工具实现与白名单校验待接入。
+- **限流和生成并发控制**：按当前需求暂缓；`RATE_*`、`MAX_CONCURRENCY_GENERATE` 仅保留配置，不执行拦截。
+- **网关业务授权**：沿用 yudao 下游授权，不启用 `ScopeGuard`，不引入本地 JWT/authstub。
+- **MCP 工具层与 OpenAPI 安全能力**：不在入口实现工具业务；MCP 仅转发，OpenAPI 默认关闭，
+  启用开关本身不代表已具备签名、防重放或配额保护。
+
+部署验收仍需目标环境真实 yudao 服务、有效 Token 及信任网络联调；本地模拟 check-token/Nacos、
+源码契约核对、离线 Jackson 互操作及上述真实 Nacos 发现联调均不能替代完整部署验证。
+入口新增延迟 p95 <10ms 是压测目标，不是现有单元测试能证明的结论。
+
+本轮提交前核查还确认以下**原基线遗留项**，本次未修改，不能视为生产安全验收已通过：
+
+- 代理与 check-token 的 HTTP 客户端仍使用默认重定向策略。3xx 未保证原样透传，
+  跨目标重定向存在自定义身份头或携 Token 查询参数的 Referer 外传风险；部署前需收紧策略并补测试。
+- 生成类 GET 等方法尚未被重试策略排除，见「失败熔断与重试」。
+- 现有 Nacos 旧缓存降级测试未确保 TTL 已过期，也未断言失败拉取确实发生；
+  本次正常注册/注销联调不能替代注册中心故障降级验证。
 
 ## 开发
 
@@ -242,17 +314,10 @@ go vet ./...      # 静态检查
 go test ./...     # 单元测试 + 端到端冒烟（internal/app/app_test.go）
 ```
 
-`internal/app/app_test.go` 会启动真实监听并在 127.0.0.1 上完整验证：健康检查、四类路由语义、
-未注册应用、关闭通道、伪造头剥离、反代转发与响应透传、上游路径改写、下游不可用、
-下游错误透传、Range 206、体积限制、请求标识透传与日志字段完整性。
+`internal/app/app_test.go` 会启动真实 Hertz TCP 监听验证：健康检查、四类路由语义、
+未注册应用、关闭通道、伪造头剥离、请求/响应流式转发、上游路径改写、下游不可用、
+下游错误透传、Range 206、体积限制、请求标识透传与日志字段完整性，
+以及租户提示、身份头数字时间、Nacos 应用别名、实际实例就绪探测、SSE 多块、流中超时与客户端断开取消。
+check-token 与 Nacos 在这些测试中使用本地模拟服务。
 
-## 开发
-
-```bash
-go build ./...    # 编译
-go vet ./...      # 静态检查
-go test ./...     # 单元测试 + 端到端冒烟（internal/app/app_test.go）
-```
-
-`internal/app/app_test.go` 会启动真实监听并在 127.0.0.1 上完整验证：健康检查、四类路由语义、
-未注册应用、关闭通道、伪造头剥离、错误体形状、体积限制、请求标识透传与日志字段完整性。
+并发与资源回归可运行 `go test -race ./...`。

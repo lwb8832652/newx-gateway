@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -216,6 +217,166 @@ func TestReadyzProbesDownstreamWhenEnabled(t *testing.T) {
 	if !strings.Contains(string(body), `"degraded"`) {
 		t.Errorf("/readyz 应报告 degraded: %s", body)
 	}
+}
+
+func TestDiscoveryPreservesHTTPSAndDefaultPorts(t *testing.T) {
+	cfg := testConfig(t, nil)
+	cfg.Apps = []config.AppConfig{
+		{Code: "secure", BaseURL: "https://example.com"},
+		{Code: "plain", BaseURL: "http://example.com"},
+	}
+	resolver, cancel, err := buildResolver(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+	for appCode, want := range map[string]string{"secure": "https://example.com:443", "plain": "http://example.com:80"} {
+		instances, err := resolver.Resolve(context.Background(), appCode)
+		if err != nil || len(instances) != 1 || instances[0].URL() != want {
+			t.Errorf("%s 解析错误: %v, %v", appCode, instances, err)
+		}
+	}
+}
+
+func TestReadyzProbesNacosInstances(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadURL := "http://" + listener.Addr().String()
+	listener.Close()
+
+	cases := []struct {
+		name      string
+		endpoints []string
+		want      int
+	}{
+		{"reachable", []string{upstream.URL}, http.StatusOK},
+		{"unreachable", []string{deadURL}, http.StatusServiceUnavailable},
+		{"no_instances", nil, http.StatusServiceUnavailable},
+		{"healthy_fallback", []string{deadURL, upstream.URL}, http.StatusOK},
+		{"slow_first_healthy_fallback", []string{slow.URL, upstream.URL}, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nacos := mockNacos(t, "yudao-system", tc.endpoints...)
+			defer nacos.Close()
+			env := startTestApp(t, func(cfg *config.Config) {
+				cfg.ReadyzProbeDownstream = true
+				cfg.Apps = []config.AppConfig{{Code: "system", Service: "yudao-system"}}
+				cfg.Discovery = config.Discovery{Enabled: true, Addr: strings.TrimPrefix(nacos.URL, "http://"), Refresh: time.Minute}
+			})
+			response, body := env.do(t, requestOptions{path: "/readyz"})
+			if response.StatusCode != tc.want {
+				t.Fatalf("状态码 = %d，期望 %d: %s", response.StatusCode, tc.want, body)
+			}
+			var ready struct {
+				Checks []struct {
+					AppCode   string `json:"app_code"`
+					Reachable bool   `json:"reachable"`
+					Error     string `json:"error"`
+				} `json:"checks"`
+			}
+			if err := json.Unmarshal(body, &ready); err != nil {
+				t.Fatalf("解析就绪响应失败: %v", err)
+			}
+			if len(ready.Checks) != 1 || ready.Checks[0].AppCode != "system" {
+				t.Fatalf("就绪检查结果错误: %s", body)
+			}
+			check := ready.Checks[0]
+			if check.Reachable != (tc.want == http.StatusOK) || (!check.Reachable && check.Error == "") {
+				t.Errorf("就绪检查结果错误: %+v", check)
+			}
+		})
+	}
+}
+
+func TestNoNacosInstancesWithoutBreakerReturnsUnavailable(t *testing.T) {
+	nacos := mockNacos(t, "yudao-system")
+	defer nacos.Close()
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "system", Service: "yudao-system"}}
+		cfg.Discovery = config.Discovery{Enabled: true, Addr: strings.TrimPrefix(nacos.URL, "http://"), Refresh: time.Minute}
+		cfg.Breaker.Enabled = false
+	})
+	response, body := env.do(t, requestOptions{path: "/web/system/v1/users"})
+	if response.StatusCode != contracts.CodeDownstreamRefused.HTTPStatus() || !strings.Contains(string(body), `"code":50201`) {
+		t.Fatalf("无实例应正常返回50201，而非panic: %d, %s", response.StatusCode, body)
+	}
+}
+
+func TestAuthUsesNacosServiceAlias(t *testing.T) {
+	var checks atomic.Int32
+	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checks.Add(1)
+		if r.URL.Path != "/system-api/oauth2/check-token" || r.Header.Get("tenant-id") != "7" {
+			t.Errorf("校验请求错误: %s, tenant-id=%q", r.URL.Path, r.Header.Get("tenant-id"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":0,"data":{"userId":42,"userType":1,"tenantId":7,"expiresTime":4070908800000}}`)
+	}))
+	defer checkServer.Close()
+	nacos := mockNacos(t, "yudao-system", checkServer.URL)
+	defer nacos.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, err := auth.ParseLoginUser(r.Header.Get("login-user"))
+		if err != nil || user == nil || user.ID != 42 {
+			t.Errorf("下游未收到有效身份: %v, %v", user, err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}, {Code: "system", Service: "yudao-system"}}
+		cfg.Discovery = config.Discovery{Enabled: true, Addr: strings.TrimPrefix(nacos.URL, "http://"), Refresh: time.Minute}
+		cfg.Auth = config.Auth{Enabled: true, AppCode: "system", CacheTTL: time.Minute, Timeout: time.Second}
+	})
+	for range 2 {
+		response, _ := env.do(t, requestOptions{
+			path: "/web/huobao/v1/dramas",
+			headers: map[string]string{
+				contracts.HeaderAuthorization: "Bearer alias-token",
+				contracts.HeaderTenantID:      "7",
+			},
+		})
+		if response.StatusCode != http.StatusOK {
+			t.Errorf("状态码 = %d，期望 200", response.StatusCode)
+		}
+	}
+	if checks.Load() != 1 {
+		t.Errorf("check-token 调用 %d 次，期望 1", checks.Load())
+	}
+}
+
+func mockNacos(t *testing.T, service string, endpoints ...string) *httptest.Server {
+	t.Helper()
+	hosts := make([]map[string]any, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		host, port, err := net.SplitHostPort(strings.TrimPrefix(endpoint, "http://"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hosts = append(hosts, map[string]any{
+			"ip": host, "port": json.Number(port), "healthy": true, "enabled": true, "weight": 1,
+		})
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("serviceName"); got != service {
+			t.Errorf("Nacos 查询服务名 = %q，期望 %q", got, service)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"hosts": hosts})
+	}))
 }
 
 func TestProxyForwardsRequestAndResponse(t *testing.T) {
@@ -600,8 +761,11 @@ func TestAuthInjectsYudaoLoginUserHeader(t *testing.T) {
 		if r.URL.Path != "/system-api/oauth2/check-token" {
 			t.Errorf("校验路径 = %q，期望 /system-api/oauth2/check-token", r.URL.Path)
 		}
+		if got := r.Header.Get("tenant-id"); got != "99" {
+			t.Errorf("check-token 租户提示 = %q，期望 99", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":0,"data":{"userId":42,"userType":1,"userInfo":{"nickname":"管理员"},"tenantId":7,"scopes":["system:user:query"],"expiresTime":"2099-01-01T00:00:00"}}`))
+		_, _ = w.Write([]byte(`{"code":0,"data":{"userId":42,"userType":1,"userInfo":{"nickname":"管理员"},"tenantId":7,"scopes":["system:user:query"],"expiresTime":4070908800000}}`))
 	}))
 	defer checkServer.Close()
 
@@ -625,8 +789,11 @@ func TestAuthInjectsYudaoLoginUserHeader(t *testing.T) {
 	})
 
 	response, _ := env.do(t, requestOptions{
-		path:    "/web/huobao/v1/dramas",
-		headers: map[string]string{contracts.HeaderAuthorization: "Bearer valid-token"},
+		path: "/web/huobao/v1/dramas",
+		headers: map[string]string{
+			contracts.HeaderAuthorization: "Bearer valid-token",
+			contracts.HeaderTenantID:      "99",
+		},
 	})
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d，期望 200", response.StatusCode)
@@ -650,9 +817,20 @@ func TestAuthInjectsYudaoLoginUserHeader(t *testing.T) {
 	if len(parsed.Scopes) != 1 || parsed.Scopes[0] != "system:user:query" {
 		t.Errorf("login-user scopes 异常: %+v", parsed.Scopes)
 	}
+	decoded, err := url.QueryUnescape(gotLoginUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(decoded), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw["expiresTime"]); got != "4070908800000" {
+		t.Errorf("expiresTime = %s，期望 yudao 毫秒时间戳 4070908800000", got)
+	}
 }
 
-// TestAuthStripsForgedLoginUser 验证客户端伪造的 login-user / tenant-id 被剥离。
+// TestAuthStripsForgedLoginUser 验证客户端伪造的 login-user 被替换为校验后的身份。
 func TestAuthStripsForgedLoginUser(t *testing.T) {
 	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -700,37 +878,10 @@ func TestAuthPassesThroughWithoutToken(t *testing.T) {
 	}))
 	defer checkServer.Close()
 
-	var gotLoginUser string
+	var gotLoginUser, gotTenantID string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotLoginUser = r.Header.Get("login-user")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
-	env := startTestApp(t, func(cfg *config.Config) {
-		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
-		cfg.Auth = config.Auth{Enabled: true, BaseURL: checkServer.URL, CacheTTL: time.Minute, Timeout: 2 * time.Second}
-	})
-
-	response, _ := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"})
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("状态码 = %d，期望 200（无令牌应放行）", response.StatusCode)
-	}
-	if gotLoginUser != "" {
-		t.Errorf("无令牌时不应注入 login-user，实际 %q", gotLoginUser)
-	}
-}
-
-func TestAuthPassesThroughOnInvalidToken(t *testing.T) {
-	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":401,"data":null,"message":"令牌已过期"}`))
-	}))
-	defer checkServer.Close()
-
-	var gotLoginUser string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotLoginUser = r.Header.Get("login-user")
+		gotTenantID = r.Header.Get("tenant-id")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
@@ -741,14 +892,53 @@ func TestAuthPassesThroughOnInvalidToken(t *testing.T) {
 	})
 
 	response, _ := env.do(t, requestOptions{
-		path:    "/web/huobao/v1/dramas",
-		headers: map[string]string{contracts.HeaderAuthorization: "Bearer expired-token"},
+		path: "/web/huobao/v1/dramas",
+		headers: map[string]string{
+			contracts.HeaderTenantID:  "7",
+			contracts.HeaderLoginUser: `{"id":999,"tenantId":1}`,
+		},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（无令牌应放行）", response.StatusCode)
+	}
+	if gotLoginUser != "" || gotTenantID != "7" {
+		t.Errorf("匿名请求应保留租户提示但剥离身份，login-user=%q, tenant-id=%q", gotLoginUser, gotTenantID)
+	}
+}
+
+func TestAuthPassesThroughOnInvalidToken(t *testing.T) {
+	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":401,"data":null,"message":"令牌已过期"}`))
+	}))
+	defer checkServer.Close()
+
+	var gotLoginUser, gotTenantID string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLoginUser = r.Header.Get("login-user")
+		gotTenantID = r.Header.Get("tenant-id")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Auth = config.Auth{Enabled: true, BaseURL: checkServer.URL, CacheTTL: time.Minute, Timeout: 2 * time.Second}
+	})
+
+	response, _ := env.do(t, requestOptions{
+		path: "/web/huobao/v1/dramas",
+		headers: map[string]string{
+			contracts.HeaderAuthorization: "Bearer expired-token",
+			contracts.HeaderTenantID:      "7",
+			contracts.HeaderLoginUser:     `{"id":999,"tenantId":1}`,
+		},
 	})
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("状态码 = %d，期望 200（令牌失效应放行，由下游判断）", response.StatusCode)
 	}
-	if gotLoginUser != "" {
-		t.Errorf("令牌失效时不应注入身份，实际 %q", gotLoginUser)
+	if gotLoginUser != "" || gotTenantID != "7" {
+		t.Errorf("令牌失效应保留租户提示但不注入身份，login-user=%q, tenant-id=%q", gotLoginUser, gotTenantID)
 	}
 }
 
@@ -846,6 +1036,109 @@ func TestProxySupportsRangeRequests(t *testing.T) {
 	}
 	if got := response.Header.Get("Content-Range"); got == "" {
 		t.Error("Content-Range 响应头应被透传")
+	}
+}
+
+func TestProxyStreamsEventsOverTCP(t *testing.T) {
+	release := make(chan struct{})
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+			_, _ = io.WriteString(w, "data: second\n\n")
+			w.(http.Flusher).Flush()
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}}
+		cfg.Timeouts.Read = 2 * time.Second
+	})
+	response, err := env.client.Get(env.baseURL + "/web/huobao/v1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	first := make([]byte, len("data: first\n\n"))
+	if _, err := io.ReadFull(response.Body, first); err != nil {
+		t.Fatalf("上游未结束前未收到首事件: %v", err)
+	}
+	if string(first) != "data: first\n\n" {
+		t.Fatalf("首事件错误: %q", first)
+	}
+	finish()
+	rest, err := io.ReadAll(response.Body)
+	if err != nil || string(rest) != "data: second\n\n" {
+		t.Fatalf("后续事件未完整透传: %q, %v", rest, err)
+	}
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Errorf("流式响应头错误: %d, %v", response.StatusCode, response.Header)
+	}
+}
+
+func TestProxyStreamBudgetOverTCP(t *testing.T) {
+	canceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	t.Cleanup(upstream.Close)
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}}
+		cfg.Timeouts.Read = 400 * time.Millisecond
+	})
+	response, err := env.client.Get(env.baseURL + "/web/huobao/v1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || string(body) != "data: first\n\n" {
+		t.Errorf("流中超时不得改写已发送状态或追加错误JSON: %d, %q", response.StatusCode, body)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("流预算到期后未取消上游请求")
+	}
+}
+
+func TestProxyClientDisconnectCancelsUpstream(t *testing.T) {
+	canceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	t.Cleanup(upstream.Close)
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL}}
+		cfg.Timeouts.Read = 5 * time.Second
+	})
+	response, err := env.client.Get(env.baseURL + "/web/huobao/v1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make([]byte, len("data: first\n\n"))
+	if _, err := io.ReadFull(response.Body, first); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("客户端断开未及时取消上游，不能等待5s预算才回收")
 	}
 }
 

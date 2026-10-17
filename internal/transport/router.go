@@ -170,6 +170,11 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 			candidates = available
 		}
 
+		if len(candidates) == 0 {
+			httpx.WriteError(c, contracts.CodeDownstreamRefused)
+			return
+		}
+
 		target := proxy.Target{
 			Scheme:   candidates[0].Scheme,
 			Host:     candidates[0].Address(),

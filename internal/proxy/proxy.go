@@ -143,13 +143,18 @@ func (e *Error) Unwrap() error { return e.Err }
 // Forward 把当前请求转发到上游，并把响应原样写回。
 //
 // 约定：返回的 error 一定是 *Error，调用方据此取出错误码；
-// 响应已经开始写出时不会再改写状态码（此时仅登记错误码）。
+// 响应体由 Hertz 在返回后消费，流中错误由 Hertz 处理，不能再返回或改写状态码。
 func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Target, family string) error {
 	method := string(rc.Method())
 	path := target.Path
 	budget := p.budget(family, method, path)
 	requestCtx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
+	transferred := false
+	defer func() {
+		if !transferred {
+			cancel()
+		}
+	}()
 
 	requestBody, contentLength, err := requestBodyOf(rc)
 	if err != nil {
@@ -174,9 +179,32 @@ func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Targ
 	// 注意：不能在这里 defer response.Body.Close()。
 	// Hertz 是在处理器返回之后才读取 bodyStream 并写出的，提前关闭会让读取失败
 	// （http: read on closed response body），表现为连接被重置、客户端收到 EOF。
-	// 响应体的所有权在此移交给 Hertz：它会在读完数据后自动调用 Close。
+	// 响应体和超时取消权一并移交给 Hertz；预算持续覆盖响应体读取。
+	response.Body = &cancelBody{ReadCloser: response.Body, cancel: cancel}
 	writeResponse(rc, response)
+	transferred = true
 	return nil
+}
+
+// cancelBody 不增加缓冲或后台 goroutine；读完、读失败或 Hertz 关闭流时释放预算。
+// Hertz 在客户端写出失败时也会关闭流，Close 先取消以中止仍在进行的上游读取。
+// context.CancelFunc 可重复调用，EOF 后的 Close 仍须关闭底层响应体。
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.cancel()
+	}
+	return n, err
+}
+
+func (b *cancelBody) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
 }
 
 // Probe 探测目标地址是否可达，供就绪检查复用同一个连接池。
@@ -201,8 +229,8 @@ func (p *Proxy) Probe(ctx context.Context, baseURL string) error {
 	}
 	// 探测不关心响应内容，直接丢弃并关闭。
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-	return nil
+	_, err = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return err
 }
 
 // probeTimeout 是单个探测的超时预算：就绪检查必须快速返回，

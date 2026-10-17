@@ -3,7 +3,8 @@ package contracts
 import "strings"
 
 // 入口与下游之间约定的请求头。
-// 除 X-Request-Id / traceparent 由客户端携带时透传外，其余均由入口注入。
+// X-Request-Id / traceparent 可由客户端携带；tenant-id 可作为未认证的租户提示，
+// 不代表登录身份。登录成功后 tenant-id 以 check-token 返回的租户覆盖。
 const (
 	// HeaderRequestID 请求标识，入口保证每条请求都有值。
 	HeaderRequestID = "X-Request-Id"
@@ -45,15 +46,14 @@ const internalHeaderPrefix = "x-internal-"
 // SpoofableHeaders 是入口必须无条件剥离的客户端伪造头。
 // 剥离发生在注入之前，确保下游与日志看到的身份信息只来自入口自身。
 //
-// login-user 与 tenant-id 是 yudao 的身份约定头，同样必须剥离：
-// 否则客户端可以伪造一个 admin 身份的 login-user 直接穿透到下游服务。
+// login-user 必须剥离，避免伪造管理员身份；tenant-id 仅为租户提示，
+// 由 HeaderGuard 校验格式，不能作为已经认证的租户身份使用。
 var SpoofableHeaders = []string{
 	HeaderUserID,
 	HeaderUserScope,
 	HeaderPrincipalID,
 	HeaderAppCode,
 	HeaderLoginUser,
-	HeaderTenantID,
 	HeaderForwardedFor,
 	HeaderForwardedHost,
 	HeaderForwardedProto,

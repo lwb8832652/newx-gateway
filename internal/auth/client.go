@@ -32,7 +32,7 @@ type tokenInfo struct {
 	UserInfo    map[string]string `json:"userInfo"`
 	TenantID    int64             `json:"tenantId"`
 	Scopes      []string          `json:"scopes"`
-	ExpiresTime string            `json:"expiresTime"`
+	ExpiresTime json.RawMessage   `json:"expiresTime"`
 }
 
 // StatusUnauthorized 是 yudao 表示「令牌已过期/无效」的业务码。
@@ -41,7 +41,7 @@ const statusUnauthorized = 401
 // TokenClient 调用 yudao 的 check-token 接口。
 type TokenClient struct {
 	// Dial 返回鉴权方基址。支持静态地址与注册中心两种来源，
-	// 由装配层注入，从而复用入口已有的服务发现与熔断能力。
+	// 由装配层注入，复用入口的服务发现与实例选择。
 	Dial       func(ctx context.Context) (string, error)
 	Path       string
 	Timeout    time.Duration
@@ -89,8 +89,8 @@ func (c *TokenClient) Check(ctx context.Context, tenantID int64, accessToken str
 		return nil, err
 	}
 	request.Header.Set("Accept", "application/json")
-	// tenant-id 头：yudao 用它做多租户隔离，必须随校验请求一起送出。
-	if tenantID > 0 {
+	// 非负值（包括显式 0）作为租户提示发送；负值表示未提供租户。
+	if tenantID >= 0 {
 		request.Header.Set("tenant-id", strconv.FormatInt(tenantID, 10))
 	}
 
@@ -132,7 +132,7 @@ func (c *TokenClient) Check(ctx context.Context, tenantID int64, accessToken str
 
 // toLoginUser 把下游 DTO 转成注入用的 LoginUser。
 func toLoginUser(info *tokenInfo) (*LoginUser, error) {
-	expiresAt, err := parseExpiresTime(info.ExpiresTime)
+	expiresAt, err := parseJSONExpiresTime(info.ExpiresTime)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +146,27 @@ func toLoginUser(info *tokenInfo) (*LoginUser, error) {
 	}, nil
 }
 
-// parseExpiresTime 兼容多种时间输出，避免下游改个序列化格式就让身份失效。
+// parseJSONExpiresTime 优先接受 yudao 默认的数字毫秒，兼容旧部署的字符串时间。
+func parseJSONExpiresTime(raw json.RawMessage) (time.Time, error) {
+	value := strings.TrimSpace(string(raw))
+	if value == "" || value == "null" {
+		return time.Time{}, nil
+	}
+	if value[0] == '"' {
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return time.Time{}, err
+		}
+		return parseExpiresTime(text)
+	}
+	millis, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("无法解析毫秒过期时间 %q: %w", value, err)
+	}
+	return time.UnixMilli(millis), nil
+}
+
+// parseExpiresTime 对无时区字符串沿用本地时区，带偏移的字符串保留其真实瞬时。
 func parseExpiresTime(raw string) (time.Time, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {

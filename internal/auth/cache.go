@@ -15,9 +15,16 @@ import (
 //     在 TTL 内反复打 check-token；
 //   - 合并并发请求：同一个 key 同时只发出一次远程调用，
 //     避免热点令牌在缓存失效瞬间把鉴权方打满。
+const defaultLoginUserCacheCapacity = 10000
+
+// 不启动后台任务：写入时限频清理过期项，达到容量后淘汰任意一项。
+// 容量限制同时作用于正常用户与负缓存，不承担请求限流职责。
 type loginUserCache struct {
-	ttl time.Duration
-	now func() time.Time
+	ttl           time.Duration
+	now           func() time.Time
+	maxEntries    int
+	sweepInterval time.Duration
+	nextSweep     time.Time
 
 	mu       sync.Mutex
 	entries  map[string]*cacheEntry
@@ -39,11 +46,17 @@ func newLoginUserCache(ttl time.Duration) *loginUserCache {
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
+	sweepInterval := ttl
+	if sweepInterval > time.Minute {
+		sweepInterval = time.Minute
+	}
 	return &loginUserCache{
-		ttl:      ttl,
-		now:      time.Now,
-		entries:  make(map[string]*cacheEntry),
-		inflight: make(map[string]*inflightCall),
+		ttl:           ttl,
+		now:           time.Now,
+		maxEntries:    defaultLoginUserCacheCapacity,
+		sweepInterval: sweepInterval,
+		entries:       make(map[string]*cacheEntry),
+		inflight:      make(map[string]*inflightCall),
 	}
 }
 
@@ -67,7 +80,22 @@ func (c *loginUserCache) Get(key string) (*LoginUser, bool) {
 func (c *loginUserCache) Put(key string, user *LoginUser) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = &cacheEntry{user: user, expiresAt: c.now().Add(c.ttl)}
+	now := c.now()
+	if !now.Before(c.nextSweep) {
+		for existingKey, entry := range c.entries {
+			if !now.Before(entry.expiresAt) {
+				delete(c.entries, existingKey)
+			}
+		}
+		c.nextSweep = now.Add(c.sweepInterval)
+	}
+	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxEntries {
+		for existingKey := range c.entries {
+			delete(c.entries, existingKey)
+			break
+		}
+	}
+	c.entries[key] = &cacheEntry{user: user, expiresAt: now.Add(c.ttl)}
 }
 
 // Do 执行加载：命中缓存直接返回，否则合并并发调用执行 loader。

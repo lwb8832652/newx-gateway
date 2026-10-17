@@ -8,6 +8,7 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app/server"
 
 	"newx-gateway/internal/contracts"
+	"newx-gateway/internal/discovery"
 	"newx-gateway/internal/httpx"
 	"newx-gateway/internal/transport"
 )
@@ -30,8 +32,8 @@ type Module struct {
 	Env              string
 	ProbeDownstream  bool
 	CheckDownstreams []Downstream
-	// Prober 为空时跳过下游探测（就绪检查只反映自身状态）。
-	Prober Prober
+	Prober           Prober
+	Resolver         discovery.Resolver
 }
 
 // Downstream 是被探测的下游目标。
@@ -123,39 +125,73 @@ func (m Module) handleReadyz(ctx context.Context, c *app.RequestContext) {
 	httpx.WriteJSON(c, status, response)
 }
 
-// probeAll 并发探测全部已配置地址的下游。
+// probeAll 并发探测已配置应用，任一可用实例连通即认为该应用可达。
 func (m Module) probeAll(ctx context.Context) []ReadyCheck {
 	checks := make([]ReadyCheck, len(m.CheckDownstreams))
 	done := make(chan struct{}, len(m.CheckDownstreams))
 
 	for index, downstream := range m.CheckDownstreams {
 		checks[index] = ReadyCheck{AppCode: downstream.AppCode, BaseURL: downstream.BaseURL}
-		if downstream.BaseURL == "" {
-			// 未配置地址表示下游尚未接入，视为可达，避免脚手架阶段恒 degraded。
-			checks[index].Reachable = true
-			done <- struct{}{}
-			continue
-		}
-
-		go func(index int, target string) {
+		go func(index int, downstream Downstream) {
 			defer func() { done <- struct{}{} }()
-			if m.Prober == nil {
-				// 没有可用的探测实现时不谎报不可达，只标记为未知。
-				checks[index].Reachable = true
-				checks[index].Error = "prober unavailable"
-				return
-			}
-			if err := m.Prober.Probe(ctx, target); err != nil {
-				checks[index].Reachable = false
+			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			if err := m.probeDownstream(probeCtx, downstream); err != nil {
 				checks[index].Error = err.Error()
 				return
 			}
 			checks[index].Reachable = true
-		}(index, downstream.BaseURL)
+		}(index, downstream)
 	}
 
 	for range m.CheckDownstreams {
 		<-done
 	}
 	return checks
+}
+
+func (m Module) probeDownstream(ctx context.Context, downstream Downstream) error {
+	if m.Prober == nil {
+		return fmt.Errorf("prober unavailable")
+	}
+	if m.Resolver == nil {
+		if downstream.BaseURL == "" {
+			return fmt.Errorf("应用 %q 未配置服务解析器或静态地址", downstream.AppCode)
+		}
+		return m.Prober.Probe(ctx, downstream.BaseURL)
+	}
+
+	instances, err := m.Resolver.Resolve(ctx, downstream.AppCode)
+	if err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(instances))
+	pending := 0
+	for _, instance := range instances {
+		if !instance.Usable() {
+			continue
+		}
+		pending++
+		go func(target string) {
+			results <- m.Prober.Probe(probeCtx, target)
+		}(instance.URL())
+	}
+	if pending == 0 {
+		return fmt.Errorf("应用 %q 没有可用实例", downstream.AppCode)
+	}
+	var lastErr error
+	for range pending {
+		select {
+		case err := <-results:
+			if err == nil {
+				return nil
+			}
+			lastErr = err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return lastErr
 }

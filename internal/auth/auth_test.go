@@ -17,7 +17,7 @@ func TestLoginUserHeaderValueRoundTrip(t *testing.T) {
 		Info:     map[string]string{"nickname": "管理员"},
 		TenantID: 10,
 		Scopes:   []string{"system:user:query"},
-		// yudao 用 Jackson 默认格式序列化 LocalDateTime：无时区后缀。
+		// yudao 的自定义 Jackson 模块在传输时使用毫秒时间戳。
 		ExpiresTime: time.Date(2026, 10, 17, 14, 30, 0, 0, time.Local),
 	}
 
@@ -302,7 +302,49 @@ func TestCacheDoDoesNotCacheErrors(t *testing.T) {
 }
 
 func TestCacheKeyIncludesTenant(t *testing.T) {
-	if cacheKey(1, "t") == cacheKey(2, "t") {
-		t.Error("缓存键必须区分租户")
+	if cacheKey(1, "t") == cacheKey(2, "t") || cacheKey(-1, "t") == cacheKey(0, "t") {
+		t.Error("缓存键必须区分租户及缺失与显式零租户")
+	}
+}
+
+func TestCacheSweepsExpiredUnvisitedEntries(t *testing.T) {
+	clock := time.Now()
+	cache := newLoginUserCache(time.Minute)
+	cache.now = func() time.Time { return clock }
+	cache.Put("old-positive", &LoginUser{ID: 1})
+	cache.Put("old-negative", nil)
+	clock = clock.Add(time.Minute)
+	cache.Put("new", &LoginUser{ID: 2})
+	if cache.Len() != 1 {
+		t.Fatalf("expired unvisited entries retained: %d", cache.Len())
+	}
+	if user, ok := cache.Get("new"); !ok || user.ID != 2 {
+		t.Fatalf("new entry missing: %+v %v", user, ok)
+	}
+}
+
+func TestCacheCapacityBoundsPositiveAndNegativeEntries(t *testing.T) {
+	cache := newLoginUserCache(time.Minute)
+	if cache.maxEntries != defaultLoginUserCacheCapacity || cache.maxEntries <= 0 {
+		t.Fatalf("invalid default capacity: %d", cache.maxEntries)
+	}
+	cache.maxEntries = 3
+	for i := int64(0); i < 100; i++ {
+		var user *LoginUser
+		if i%2 == 0 {
+			user = &LoginUser{ID: i + 1}
+		}
+		key := cacheKey(i, "random-token")
+		cache.Put(key, user)
+		if cache.Len() > 3 {
+			t.Fatalf("cache exceeded capacity: %d", cache.Len())
+		}
+		if got, ok := cache.Get(key); !ok || got != user {
+			t.Fatalf("latest entry missing: %+v %v", got, ok)
+		}
+	}
+	cache.Put(cacheKey(99, "random-token"), &LoginUser{ID: 999})
+	if cache.Len() != 3 {
+		t.Fatalf("updating existing entry should not evict: %d", cache.Len())
 	}
 }

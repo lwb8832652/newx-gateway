@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"context"
+	"strconv"
+	"strings"
 
 	"github.com/cloudwego/hertz/pkg/app"
 
@@ -15,6 +17,14 @@ import (
 // 再由入口按自身解析结果重新注入。遍历与删除必须分两步，否则会漏删。
 func HeaderGuard() app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
+		// tenant-id 是客户端可提供的租户选择提示，不是可信登录身份。
+		// 规范化后供匿名接口与 check-token 使用；认证成功时由真实租户覆盖。
+		rawTenant := strings.TrimSpace(c.Request.Header.Get(contracts.HeaderTenantID))
+		tenantID, err := strconv.ParseInt(rawTenant, 10, 64)
+		c.Request.Header.Del(contracts.HeaderTenantID)
+		if err == nil && tenantID >= 0 {
+			c.Request.Header.Set(contracts.HeaderTenantID, strconv.FormatInt(tenantID, 10))
+		}
 		var spoofed []string
 		c.Request.Header.VisitAll(func(key, _ []byte) {
 			if contracts.IsSpoofableHeader(string(key)) {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -51,7 +52,7 @@ func (s *Service) Enabled() bool { return s != nil && s.opts.Enabled }
 // Middleware 返回认证中间件。
 //
 // 处理顺序与 yudao 的 TokenAuthenticationFilter 一致：
-//  1. 剥离客户端伪造的 login-user / tenant-id 头（由 HeaderGuard 完成）；
+//  1. 剥离客户端伪造的 login-user，校验 tenant-id 提示格式（由 HeaderGuard 完成）；
 //  2. 无 Bearer Token → 直接放行；
 //  3. 有 Token → 查缓存，未命中调 check-token；
 //  4. 解析出未过期用户 → 注入 login-user / tenant-id 头与上下文；
@@ -83,7 +84,7 @@ func (s *Service) Middleware() app.HandlerFunc {
 			if s.logger != nil {
 				s.logger.Warn("校验访问令牌失败，按无身份放行",
 					"request_id", httpx.RequestID(c),
-					"err", err,
+					"error_type", fmt.Sprintf("%T", err),
 				)
 			}
 			c.Next(ctx)
@@ -128,15 +129,12 @@ func ObtainAuthorization(c *app.RequestContext) string {
 	return strings.TrimSpace(authorization[index+len(bearerPrefix):])
 }
 
-// tenantIDFromRequest 读取客户端传入的租户编号，非数字按 0 处理。
+// tenantIDFromRequest 读取租户提示，缺失或非法返回 -1，与显式租户 0 区分。
 func tenantIDFromRequest(c *app.RequestContext) int64 {
 	raw := strings.TrimSpace(c.Request.Header.Get(contracts.HeaderTenantID))
-	if raw == "" {
-		return 0
-	}
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value < 0 {
-		return 0
+		return -1
 	}
 	return value
 }

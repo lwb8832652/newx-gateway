@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,16 +20,35 @@ type StaticResolver struct {
 	addresses map[string][]Instance
 }
 
-// NewStaticResolver 用「服务名 → host:port 列表」构建静态解析器。
-// 地址格式非法会直接返回错误，让配置问题在启动期暴露。
+// NewStaticResolver 接受 host:port 或完整 HTTP/HTTPS URL，未指定端口时使用协议默认值。
 func NewStaticResolver(addresses map[string][]string) (*StaticResolver, error) {
 	resolved := make(map[string][]Instance, len(addresses))
 	for service, list := range addresses {
 		instances := make([]Instance, 0, len(list))
 		for _, address := range list {
-			host, port, err := net.SplitHostPort(strings.TrimSpace(address))
-			if err != nil {
-				return nil, fmt.Errorf("服务 %q 的地址 %q 需为 host:port 形式: %w", service, address, err)
+			endpoint := strings.TrimSpace(address)
+			scheme := "http"
+			if strings.Contains(endpoint, "://") {
+				parsed, err := url.Parse(endpoint)
+				if err != nil {
+					return nil, fmt.Errorf("服务 %q 的地址 %q 非法: %w", service, address, err)
+				}
+				scheme = parsed.Scheme
+				if scheme != "http" && scheme != "https" {
+					return nil, fmt.Errorf("服务 %q 的地址 %q 仅支持 HTTP/HTTPS", service, address)
+				}
+				port := parsed.Port()
+				if port == "" {
+					port = "80"
+					if scheme == "https" {
+						port = "443"
+					}
+				}
+				endpoint = net.JoinHostPort(parsed.Hostname(), port)
+			}
+			host, port, err := net.SplitHostPort(endpoint)
+			if err != nil || host == "" {
+				return nil, fmt.Errorf("服务 %q 的地址 %q 需包含主机与有效端口", service, address)
 			}
 			portNumber, err := strconv.Atoi(port)
 			if err != nil || portNumber < 1 || portNumber > 65535 {
@@ -38,7 +58,7 @@ func NewStaticResolver(addresses map[string][]string) (*StaticResolver, error) {
 				Service: service,
 				Host:    host,
 				Port:    portNumber,
-				Scheme:  "http",
+				Scheme:  scheme,
 				Weight:  1,
 				Healthy: true,
 				Enabled: true,
@@ -78,20 +98,30 @@ func (s *StaticResolver) Services() []string {
 	return services
 }
 
-// Multi 按服务选择解析器，让静态地址与注册中心发现共存。
+// Multi 按应用编码选择解析器，并映射到实际注册中心服务名。
 type Multi struct {
-	services map[string]Resolver
+	services map[string]serviceResolver
+}
+
+type serviceResolver struct {
+	resolver Resolver
+	service  string
 }
 
 // NewMulti 构建组合解析器。
-func NewMulti() *Multi { return &Multi{services: make(map[string]Resolver)} }
+func NewMulti() *Multi { return &Multi{services: make(map[string]serviceResolver)} }
 
-// Add 为某个服务指定解析器。
+// Add 为某个服务指定同名解析器。
 func (m *Multi) Add(service string, resolver Resolver) {
-	if m == nil || service == "" || resolver == nil {
+	m.AddAlias(service, service, resolver)
+}
+
+// AddAlias 将应用编码映射到解析器使用的实际服务名。
+func (m *Multi) AddAlias(appCode, service string, resolver Resolver) {
+	if m == nil || appCode == "" || service == "" || resolver == nil {
 		return
 	}
-	m.services[service] = resolver
+	m.services[appCode] = serviceResolver{resolver: resolver, service: service}
 }
 
 // Resolve 实现 Resolver。
@@ -103,7 +133,7 @@ func (m *Multi) Resolve(ctx context.Context, service string) ([]Instance, error)
 	if !ok {
 		return nil, fmt.Errorf("服务 %q 未配置任何解析来源", service)
 	}
-	return resolver.Resolve(ctx, service)
+	return resolver.resolver.Resolve(ctx, resolver.service)
 }
 
 // Services 返回已配置解析来源的服务名，按字典序排列。

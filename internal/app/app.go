@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -72,6 +71,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		// 请求体改为流式：大文件上传不再整体读进内存，由转发层直接搬运字节。
 		// 注意这会改变 Body() 的语义（返回已缓冲部分），因此反代必须使用 BodyStream()。
 		server.WithStreamBody(true),
+		server.WithSenseClientDisconnection(true),
 		// 协议层体积上限与中间件的语义层校验构成两道防线，分工不同：
 		//   - 协议层用「上传通道上限」兜底，避免恶意超大 body 被读入内存；
 		//   - 语义层（middleware.BodyLimit）按普通通道上限给出统一的 40002 错误体。
@@ -129,8 +129,9 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		breaker = lb.NewBreaker(cfg.Breaker.FailureThreshold, cfg.Breaker.Cooldown)
 	}
 
-	// 就绪检查复用转发器的连接池，避免每个探测都新建客户端。
+	// 就绪检查复用实例解析与转发器连接池。
 	healthModule := health.New(cfg.Version, cfg.Env, cfg.ReadyzProbeDownstream, downstreams(cfg), proxyClient)
+	healthModule.Resolver = resolver
 
 	deps := transport.Deps{
 		Config:    cfg,
@@ -215,8 +216,7 @@ func maxDuration(values ...time.Duration) time.Duration {
 // buildAuthMiddleware 构建认证中间件。
 //
 // 鉴权方来源二选一：AUTH_APP_CODE 走注册表解析（可用 nacos:// 服务发现），
-// AUTH_BASE_URL 用静态地址。两者都未配置时中间件退化为放行，
-// 保证脚手架阶段不因为缺少鉴权方而无法启动。
+// AUTH_BASE_URL 用静态地址。认证启用时，配置校验保证来源唯一且已配置。
 func buildAuthMiddleware(cfg *config.Config, resolver discovery.Resolver, logger *slog.Logger) app.HandlerFunc {
 	if !cfg.Auth.Enabled {
 		return func(ctx context.Context, c *app.RequestContext) { c.Next(ctx) }
@@ -231,16 +231,7 @@ func buildAuthMiddleware(cfg *config.Config, resolver discovery.Resolver, logger
 			if err != nil {
 				return "", err
 			}
-			usable := make([]string, 0, len(instances))
-			for _, instance := range instances {
-				if instance.Usable() {
-					usable = append(usable, instance.URL())
-				}
-			}
-			if len(usable) == 0 {
-				return "", fmt.Errorf("鉴权方 %q 没有可用实例", cfg.Auth.AppCode)
-			}
-			// 复用负载均衡的随机权重选取，避免自造第二套选路逻辑。
+			// 复用负载均衡的可用性过滤和随机权重选取。
 			chosen, ok := lb.Pick(instances)
 			if !ok {
 				return "", fmt.Errorf("鉴权方 %q 没有可用实例", cfg.Auth.AppCode)
@@ -286,14 +277,14 @@ func buildResolver(cfg *config.Config, logger *slog.Logger) (discovery.Resolver,
 	multi := discovery.NewMulti()
 
 	staticAddresses := make(map[string][]string)
-	nacosServices := make([]string, 0, len(cfg.Apps))
+	nacosServices := make(map[string]string)
 	for _, app := range cfg.Apps {
 		if app.Service != "" {
-			nacosServices = append(nacosServices, app.Service)
+			nacosServices[app.Code] = app.Service
 			continue
 		}
-		if address := hostPortOf(app.BaseURL); address != "" {
-			staticAddresses[app.Code] = append(staticAddresses[app.Code], address)
+		if app.BaseURL != "" {
+			staticAddresses[app.Code] = append(staticAddresses[app.Code], app.BaseURL)
 		}
 	}
 
@@ -321,8 +312,8 @@ func buildResolver(cfg *config.Config, logger *slog.Logger) (discovery.Resolver,
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, service := range nacosServices {
-			multi.Add(service, nacosResolver)
+		for appCode, service := range nacosServices {
+			multi.AddAlias(appCode, service, nacosResolver)
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -355,20 +346,4 @@ func proxyOptions(cfg *config.Config) proxy.Options {
 		MaxIdleConnsPerHost: 64,
 		TrustProxyHeaders:   cfg.TrustProxyHeaders,
 	}
-}
-
-// hostPortOf 提取 URL 的主机部分（host:port）。
-func hostPortOf(rawURL string) string {
-	if rawURL == "" {
-		return ""
-	}
-	slash := strings.Index(rawURL, "://")
-	if slash < 0 {
-		return ""
-	}
-	rest := rawURL[slash+3:]
-	if at := strings.IndexAny(rest, "/?#"); at >= 0 {
-		rest = rest[:at]
-	}
-	return rest
 }

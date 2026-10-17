@@ -53,6 +53,55 @@ func TestStaticResolverRejectsBadAddress(t *testing.T) {
 	}
 }
 
+func TestStaticResolverPreservesSchemeAndDefaultPort(t *testing.T) {
+	cases := []struct {
+		address string
+		want    string
+	}{
+		{"https://example.com", "https://example.com:443"},
+		{"http://example.com", "http://example.com:80"},
+		{"https://example.com:8443/api", "https://example.com:8443"},
+		{"https://[::1]", "https://[::1]:443"},
+		{"127.0.0.1:8080", "http://127.0.0.1:8080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.address, func(t *testing.T) {
+			resolver, err := NewStaticResolver(map[string][]string{"system": {tc.address}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			instances, err := resolver.Resolve(context.Background(), "system")
+			if err != nil || len(instances) != 1 {
+				t.Fatalf("解析失败: %v, %v", instances, err)
+			}
+			if got := instances[0].URL(); got != tc.want {
+				t.Errorf("URL = %q，期望 %q", got, tc.want)
+			}
+		})
+	}
+	for _, address := range []string{"ftp://example.com:21", "https://:443", "http://example.com:0"} {
+		if _, err := NewStaticResolver(map[string][]string{"system": {address}}); err == nil {
+			t.Errorf("应拒绝非法地址 %q", address)
+		}
+	}
+}
+
+func TestMultiResolverMapsAppCodeToServiceName(t *testing.T) {
+	static, err := NewStaticResolver(map[string][]string{"yudao-system": {"127.0.0.1:48081"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi := NewMulti()
+	multi.AddAlias("system", "yudao-system", static)
+	instances, err := multi.Resolve(context.Background(), "system")
+	if err != nil || len(instances) != 1 || instances[0].Service != "yudao-system" {
+		t.Fatalf("别名解析失败: %v, %v", instances, err)
+	}
+	if services := multi.Services(); len(services) != 1 || services[0] != "system" {
+		t.Fatalf("应用编码列表错误: %v", services)
+	}
+}
+
 func TestMultiResolver(t *testing.T) {
 	static, err := NewStaticResolver(map[string][]string{"huobao": {"127.0.0.1:5679"}})
 	if err != nil {
