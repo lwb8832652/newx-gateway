@@ -7,9 +7,11 @@
 
 **P1 反代已打通。** 已完成：工程骨架、配置与契约、注册表、四类路由壳、healthz/readyz、
 slog JSON 日志与 W3C traceparent 透传、伪造头剥离、统一错误出口、
-**Nacos 服务发现（HTTP 开放 API）+ 随机权重负载均衡 + 灰度（version/tag）+ HTTP 反代**。
+**Nacos 服务发现（HTTP 开放 API）+ 随机权重负载均衡 + 灰度（version/tag）+ HTTP 反代**、
+按请求类型的超时分级、失败熔断、幂等重试、
+**认证（yudao 方式：远程校验 + `login-user` 头注入 + 本地缓存）**。
 
-尚未接入：鉴权与 JWT 签发（`authstub`）、限流计数、MCP 工具实现。
+尚未接入：限流计数与拦截、MCP 工具实现。
 
 ## 技术栈
 
@@ -46,11 +48,11 @@ go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --alway
 
 ## 路由规范
 
-| 路由 | 调用方 | 认证策略（接入后） | 本阶段行为 |
+| 路由 | 调用方 | 认证策略（yudao 方式启用后） | 当前行为 |
 | --- | --- | --- | --- |
-| `/web/{app_code}/v1/*` | Web、Electron | 用户 JWT + 应用 Scope + 基础限流 | 校验 app_code 后返回 `50101` |
-| `/admin/{app_code}/v1/*` | 管理后台 | 管理员 JWT + RBAC + 审计 + 独立限流 | 校验 app_code 后返回 `50101` |
-| `/mcp/{app_code}/*` | MCP Client | 独立凭证 + 工具白名单 + 严格超时 | 启用时返回 `50101`；禁用时不注册路由，返回 `40401` |
+| `/web/{app_code}/v1/*` | Web、Electron | `login-user`/`tenant-id` 头注入，是否拦截由下游决定 | 校验 app_code 后转发下游 |
+| `/admin/{app_code}/v1/*` | 管理后台 | 同上（yudao 服务自带 RBAC） | 校验 app_code 后转发下游 |
+| `/mcp/{app_code}/*` | MCP Client | 独立凭证 + 工具白名单 + 严格超时 | 启用时转发；禁用时返回 `40401` |
 | `/open-api/{app_code}/v1/*` | 外部系统 | API Client + 签名 + 防重放 + 配额 | **默认关闭**，返回 `40401` |
 | `/healthz` `/readyz` | 运维 | 无 | 见「健康检查」 |
 | 其他 | — | 无 | 兜底返回 `40401` |
@@ -127,12 +129,13 @@ newx-gateway/
 ├── cmd/server/            进程入口：配置加载、启动、信号与优雅退出
 └── internal/
     ├── app/               装配层：中间件顺序、路由注册、协议层参数
+    ├── auth/              认证（yudao 方式）：check-token 客户端、登录用户缓存、login-user 头注入
     ├── config/            环境变量解析与启动期校验
     ├── contracts/         契约：错误码、错误响应体、请求头、上下文键、路由家族
     ├── discovery/         服务发现：静态地址 + Nacos 开放 API（缓存、降级、后台刷新）
     ├── httpx/             基于 Hertz 上下文的读写工具与统一响应出口
     ├── lb/                随机权重负载均衡、灰度筛选（version/tag）与失败熔断
-    ├── middleware/        恢复、追踪、日志、头部治理、体积限制 + 鉴权/范围/限流空位
+    ├── middleware/        恢复、追踪、日志、头部治理、体积限制 + 范围/限流空位
     ├── observability/     结构化日志与链路标识
     ├── proxy/             下游 HTTP 转发：流式请求/响应、超时分级、错误码映射
     ├── registry/          app_code 注册表（含上游路径改写）
@@ -191,21 +194,45 @@ newx-gateway/
 
 下游自身的 4xx/5xx **原样透传**（客户端错误处理不被入口破坏），仅在日志里归类为 `50202`。
 
+## 认证（沿用 yudao-cloud 网关方式）
+
+完全复刻 yudao-gateway 的 `TokenAuthenticationFilter` 行为，不做本地 JWT 校验：
+
+```
+请求 → 剥离客户端伪造的 login-user / tenant-id 头
+     → 无 Bearer Token？直接放行（不注入任何身份头）
+     → 有 Token → 查本地缓存（TTL 默认 1 分钟，含负缓存，合并并发请求）
+               → 未命中调 check-token 接口换取 LoginUser
+     → 有效 → 注入 login-user（LoginUser JSON + URL-encode）与 tenant-id 头
+     → 无效 / 已过期 / 鉴权方不可用 → 放行但不带身份
+```
+
+**关键点**：
+
+- `login-user` 是**芋道框架的私有头**（定义在 `yudao-spring-boot-starter-security`），
+  不是 OAuth2/OIDC 标准。字段必须与 yudao 的 `LoginUser` 完全一致：
+  `id`/`userType`/`info`/`tenantId`/`scopes`/`expiresTime`；
+  时间格式固定 `2006-01-02T15:04:05`（对应 Jackson 对 `LocalDateTime` 的默认输出）。
+- **网关不拦截**：是否需要登录、有没有权限，全部由下游服务判断。
+  这与「入口做 JWT + Scope 校验」是两条不同的路线，选这条就意味着权限判断下沉。
+- 鉴权方可用 `AUTH_APP_CODE`（走注册表，支持 `nacos://` 服务发现）或 `AUTH_BASE_URL`（静态地址）。
+- 鉴权方不可用时**按无身份放行**：入口不因为认证链路抖动变成单点。
+- 客户端伪造的 `login-user`/`tenant-id` 一律剥离，否则可以冒充 admin 身份穿透到下游。
+
 ## 当前范围与后续接入点
 
 已交付：配置与契约、注册表、四类路由壳、健康检查、日志与链路、伪造头剥离、统一错误出口、
 Nacos 服务发现、随机权重负载均衡、灰度筛选、HTTP 反代（流式请求/响应、Range 透传）、
-按请求类型的超时分级、失败熔断、幂等重试、上传通道体积豁免。
+按请求类型的超时分级、失败熔断、幂等重试、上传通道体积豁免、
+认证（yudao 方式：远程校验 + `login-user` 头注入 + 本地缓存）。
 
 尚未交付（按依赖顺序）：
 
-1. **鉴权与授权范围**：补齐 `middleware.Authenticator` 的 JWT 本地校验，打开 `ScopeGuard.SetEnabled(true)`。
-   签发方优先使用内置 `authstub`（仅 dev/CI），后续替换为 Admin Service，入口只换配置不改代码。
-   与 yudao 对接时还需要支持它约定的 `login-user`（JSON）与 `tenant-id` 请求头。
-2. **限流**：在 `middleware.Limiter` 中按主体维度计数，超限返回 `42901` 与 `Retry-After`；
+1. **限流**：在 `middleware.Limiter` 中按主体维度计数，超限返回 `42901` 与 `Retry-After`；
    生成类额外受 `MAX_CONCURRENCY_GENERATE` 约束，超并发快速失败而非排队。
-3. **按请求类型细化超时**：当前预算按路由家族近似划分，待路由元数据就绪后细化为
-   读/写/生成/上传四类各自独立预算。
+2. **授权范围（可选）**：yudao 方式下权限判断默认下沉到下游服务；
+   若某条路由必须在入口拦截，可启用 `ScopeGuard`（规则与分桶能力已就绪）。
+3. **MCP 工具白名单**：`transport/mcp` 路由壳已就绪，工具实现与白名单校验待接入。
 
 ## 开发
 

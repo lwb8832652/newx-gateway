@@ -21,6 +21,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 
+	"newx-gateway/internal/auth"
 	"newx-gateway/internal/config"
 	"newx-gateway/internal/contracts"
 	"newx-gateway/internal/discovery"
@@ -95,11 +96,12 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		middleware.BodyLimit(cfg.MaxBodyBytes, cfg.TimeoutRules.UploadPaths, cfg.MaxBodyBytesUpload),
 	)
 
-	// 家族级中间件：鉴权 → 范围校验 → 限流。本阶段三者均为空位（恒放行），
-	// 接入签发方与计数逻辑后无需改动路由注册。
+	// 家族级中间件：鉴权 → 范围校验 → 限流。
+	// 鉴权沿用 yudao-cloud 网关的方式（远程校验 + 注入 login-user 头）；
+	// 范围校验与限流仍为空位，yudao 的权限判断本就下沉在各服务内。
 	scopeGuard := middleware.NewScopeGuard()
 	limiter := middleware.NewLimiter(cfg.Rates, cfg.MCPEnabled, cfg.OpenAPIEnabled)
-	authMiddleware := middleware.Authenticator(logger)
+	authMiddleware := buildAuthMiddleware(cfg, resolver, logger)
 	familyChain := func(bucket string) []app.HandlerFunc {
 		return []app.HandlerFunc{
 			authMiddleware,
@@ -208,6 +210,64 @@ func maxDuration(values ...time.Duration) time.Duration {
 		}
 	}
 	return result
+}
+
+// buildAuthMiddleware 构建认证中间件。
+//
+// 鉴权方来源二选一：AUTH_APP_CODE 走注册表解析（可用 nacos:// 服务发现），
+// AUTH_BASE_URL 用静态地址。两者都未配置时中间件退化为放行，
+// 保证脚手架阶段不因为缺少鉴权方而无法启动。
+func buildAuthMiddleware(cfg *config.Config, resolver discovery.Resolver, logger *slog.Logger) app.HandlerFunc {
+	if !cfg.Auth.Enabled {
+		return func(ctx context.Context, c *app.RequestContext) { c.Next(ctx) }
+	}
+
+	dial := func(ctx context.Context) (string, error) {
+		if cfg.Auth.AppCode != "" {
+			if resolver == nil {
+				return "", fmt.Errorf("鉴权方 %q 无法解析：服务发现未配置", cfg.Auth.AppCode)
+			}
+			instances, err := resolver.Resolve(ctx, cfg.Auth.AppCode)
+			if err != nil {
+				return "", err
+			}
+			usable := make([]string, 0, len(instances))
+			for _, instance := range instances {
+				if instance.Usable() {
+					usable = append(usable, instance.URL())
+				}
+			}
+			if len(usable) == 0 {
+				return "", fmt.Errorf("鉴权方 %q 没有可用实例", cfg.Auth.AppCode)
+			}
+			// 复用负载均衡的随机权重选取，避免自造第二套选路逻辑。
+			chosen, ok := lb.Pick(instances)
+			if !ok {
+				return "", fmt.Errorf("鉴权方 %q 没有可用实例", cfg.Auth.AppCode)
+			}
+			return chosen.URL(), nil
+		}
+		if cfg.Auth.BaseURL != "" {
+			return cfg.Auth.BaseURL, nil
+		}
+		return "", fmt.Errorf("鉴权方未配置")
+	}
+
+	client := auth.NewTokenClient(dial, cfg.Auth.CheckPath, cfg.Auth.Timeout)
+	service := auth.New(client, auth.Options{
+		Enabled:  true,
+		CacheTTL: cfg.Auth.CacheTTL,
+	}, logger)
+
+	if logger != nil {
+		logger.Info("认证中间件已启用（yudao 方式：远程校验 + login-user 头注入）",
+			"auth_app_code", cfg.Auth.AppCode,
+			"auth_base_url", cfg.Auth.BaseURL,
+			"check_path", cfg.Auth.CheckPath,
+			"cache_ttl", cfg.Auth.CacheTTL.String(),
+		)
+	}
+	return service.Middleware()
 }
 
 // downstreams 把应用注册表转换为健康检查的探测目标。

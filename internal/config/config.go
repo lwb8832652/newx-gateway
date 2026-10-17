@@ -62,6 +62,11 @@ const (
 	DefaultBreakerEnabled      = true
 	DefaultBreakerThreshold    = 5
 	DefaultBreakerCooldown     = 10 * time.Second
+	// DefaultAuthCacheTTL 与 yudao 网关的 Guava 缓存时长保持一致。
+	DefaultAuthCacheTTL  = time.Minute
+	DefaultAuthTimeout   = 3 * time.Second
+	DefaultAuthCheckPath = "/system-api/oauth2/check-token"
+	DefaultAuthEnabled   = false
 	// DefaultGeneratePaths 与 DefaultUploadPaths 对应设计文档 §6 的预算分类。
 	DefaultGeneratePaths = "/agent,/tasks,/merge,/previs,/task-queue"
 	DefaultUploadPaths   = "/upload"
@@ -117,6 +122,22 @@ type TimeoutRules struct {
 	UploadPaths []string
 }
 
+// Auth 是认证配置（沿用 yudao-cloud 网关的认证方式）。
+type Auth struct {
+	// Enabled 是否启用身份解析。关闭时中间件直接放行，不注入任何身份头。
+	Enabled bool
+	// AppCode 是鉴权方在注册表中的应用编码；为空表示使用静态地址。
+	AppCode string
+	// BaseURL 是鉴权方静态地址，AppCode 为空时使用。
+	BaseURL string
+	// CheckPath 是令牌校验接口路径，默认 /system-api/oauth2/check-token。
+	CheckPath string
+	// CacheTTL 是登录用户缓存时长，默认 1 分钟（与 yudao 一致）。
+	CacheTTL time.Duration
+	// Timeout 是单次校验的超时。
+	Timeout time.Duration
+}
+
 // Timeouts 是按路由类别划分的超时预算。
 // 本阶段仅解析与校验，尚未参与转发逻辑（反代接入后启用）。
 type Timeouts struct {
@@ -156,6 +177,8 @@ type Config struct {
 
 	AuthIssuerBaseURL string
 	AuthStubEnabled   bool
+	// Auth 是 yudao 方式认证的开关与参数。
+	Auth Auth
 
 	MaxBodyBytes       int64
 	MaxBodyBytesUpload int64
@@ -217,6 +240,14 @@ func parse(lookup func(string) (string, bool)) (*Config, error) {
 
 		AuthIssuerBaseURL: reader.str("AUTH_ISSUER_BASE_URL", DefaultAuthIssuerBaseURL),
 		AuthStubEnabled:   reader.boolean("AUTH_STUB_ENABLED", DefaultAuthStubEnabled, &errs),
+		Auth: Auth{
+			Enabled:   reader.boolean("AUTH_ENABLED", DefaultAuthEnabled, &errs),
+			AppCode:   reader.str("AUTH_APP_CODE", ""),
+			BaseURL:   reader.str("AUTH_BASE_URL", ""),
+			CheckPath: reader.str("AUTH_CHECK_PATH", DefaultAuthCheckPath),
+			CacheTTL:  reader.duration("AUTH_CACHE_TTL", DefaultAuthCacheTTL, &errs),
+			Timeout:   reader.duration("AUTH_TIMEOUT", DefaultAuthTimeout, &errs),
+		},
 
 		MaxBodyBytes:       reader.int64("MAX_BODY_BYTES", DefaultMaxBodyBytes, &errs),
 		MaxBodyBytesUpload: reader.int64("MAX_BODY_BYTES_UPLOAD", DefaultMaxBodyBytesUpload, &errs),
@@ -465,6 +496,37 @@ func (c *Config) Validate() error {
 	if c.AuthIssuerBaseURL != "" {
 		if err := validateDownstreamURL(c.AuthIssuerBaseURL); err != nil {
 			errs = append(errs, fmt.Errorf("AUTH_ISSUER_BASE_URL 非法: %w", err))
+		}
+	}
+
+	// 认证启用时必须给出可用的鉴权方来源，且两个来源只能选一个，
+	// 否则「到底连哪个」要到运行期才能发现，属于配置歧义。
+	if c.Auth.Enabled {
+		if c.Auth.AppCode == "" && c.Auth.BaseURL == "" {
+			errs = append(errs, errors.New("AUTH_ENABLED=true 时需要配置 AUTH_APP_CODE 或 AUTH_BASE_URL"))
+		}
+		if c.Auth.AppCode != "" && c.Auth.BaseURL != "" {
+			errs = append(errs, errors.New("AUTH_APP_CODE 与 AUTH_BASE_URL 只能配置一个"))
+		}
+		if c.Auth.AppCode != "" {
+			if _, ok := c.AppByCode(c.Auth.AppCode); !ok {
+				errs = append(errs, fmt.Errorf("AUTH_APP_CODE %q 不在 APPS 注册表中", c.Auth.AppCode))
+			}
+		}
+		if c.Auth.BaseURL != "" {
+			if err := validateDownstreamURL(c.Auth.BaseURL); err != nil {
+				errs = append(errs, fmt.Errorf("AUTH_BASE_URL 非法: %w", err))
+			}
+		}
+		// CheckPath 为空表示使用默认值，只有显式配了才校验格式。
+		if c.Auth.CheckPath != "" && !strings.HasPrefix(c.Auth.CheckPath, "/") {
+			errs = append(errs, fmt.Errorf("AUTH_CHECK_PATH 需以 / 开头: %q", c.Auth.CheckPath))
+		}
+		if c.Auth.CacheTTL <= 0 {
+			errs = append(errs, fmt.Errorf("AUTH_CACHE_TTL 必须为正数: %s", c.Auth.CacheTTL))
+		}
+		if c.Auth.Timeout <= 0 {
+			errs = append(errs, fmt.Errorf("AUTH_TIMEOUT 必须为正数: %s", c.Auth.Timeout))
 		}
 	}
 

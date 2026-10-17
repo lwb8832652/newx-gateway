@@ -18,6 +18,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 
+	"newx-gateway/internal/auth"
 	"newx-gateway/internal/config"
 	"newx-gateway/internal/contracts"
 	"newx-gateway/internal/httpx"
@@ -589,6 +590,235 @@ func TestProxyCircuitBreakerStopsHammeringFailedDownstream(t *testing.T) {
 	// 前两次真正打到下游，之后被熔断拦下，不再继续发送。
 	if got := hits.Load(); got != 2 {
 		t.Errorf("下游被请求 %d 次，期望 2（熔断后应停止发送）", got)
+	}
+}
+
+// TestAuthInjectsYudaoLoginUserHeader 端到端验证 yudao 认证方式：
+// 校验成功 → 下游收到 login-user（JSON + URL-encode）与 tenant-id 头。
+func TestAuthInjectsYudaoLoginUserHeader(t *testing.T) {
+	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/system-api/oauth2/check-token" {
+			t.Errorf("校验路径 = %q，期望 /system-api/oauth2/check-token", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"userId":42,"userType":1,"userInfo":{"nickname":"管理员"},"tenantId":7,"scopes":["system:user:query"],"expiresTime":"2099-01-01T00:00:00"}}`))
+	}))
+	defer checkServer.Close()
+
+	var gotLoginUser, gotTenantID string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLoginUser = r.Header.Get("login-user")
+		gotTenantID = r.Header.Get("tenant-id")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Auth = config.Auth{
+			Enabled:   true,
+			BaseURL:   checkServer.URL,
+			CheckPath: "/system-api/oauth2/check-token",
+			CacheTTL:  time.Minute,
+			Timeout:   2 * time.Second,
+		}
+	})
+
+	response, _ := env.do(t, requestOptions{
+		path:    "/web/huobao/v1/dramas",
+		headers: map[string]string{contracts.HeaderAuthorization: "Bearer valid-token"},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", response.StatusCode)
+	}
+
+	if gotTenantID != "7" {
+		t.Errorf("tenant-id = %q，期望 7（来自 check-token 返回，而非客户端）", gotTenantID)
+	}
+
+	// login-user 必须是 yudao 的私有格式：JSON 再 URL-encode，且字段名一致。
+	parsed, err := auth.ParseLoginUser(gotLoginUser)
+	if err != nil {
+		t.Fatalf("login-user 头无法解析: %v，原值 %q", err, gotLoginUser)
+	}
+	if parsed.ID != 42 || parsed.TenantID != 7 || parsed.UserType != 1 {
+		t.Errorf("login-user 字段异常: %+v", parsed)
+	}
+	if parsed.Info["nickname"] != "管理员" {
+		t.Errorf("login-user info 异常: %+v", parsed.Info)
+	}
+	if len(parsed.Scopes) != 1 || parsed.Scopes[0] != "system:user:query" {
+		t.Errorf("login-user scopes 异常: %+v", parsed.Scopes)
+	}
+}
+
+// TestAuthStripsForgedLoginUser 验证客户端伪造的 login-user / tenant-id 被剥离。
+func TestAuthStripsForgedLoginUser(t *testing.T) {
+	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"userId":42,"userType":1,"tenantId":7,"expiresTime":"2099-01-01T00:00:00"}}`))
+	}))
+	defer checkServer.Close()
+
+	var gotLoginUser string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLoginUser = r.Header.Get("login-user")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Auth = config.Auth{Enabled: true, BaseURL: checkServer.URL, CacheTTL: time.Minute, Timeout: 2 * time.Second}
+	})
+
+	// 客户端伪造一个 admin 身份，必须被入口剥掉，替换为真实校验结果。
+	env.do(t, requestOptions{
+		path: "/web/huobao/v1/dramas",
+		headers: map[string]string{
+			contracts.HeaderAuthorization: "Bearer valid-token",
+			contracts.HeaderLoginUser:     `{"id":999,"tenantId":1}`,
+			contracts.HeaderTenantID:      "1",
+		},
+	})
+
+	parsed, err := auth.ParseLoginUser(gotLoginUser)
+	if err != nil {
+		t.Fatalf("login-user 解析失败: %v，原值 %q", err, gotLoginUser)
+	}
+	if parsed.ID != 42 {
+		t.Errorf("伪造身份未被剥离，下游收到 id=%d", parsed.ID)
+	}
+}
+
+// TestAuthPassesThroughWithoutToken 与 TestAuthPassesThroughOnInvalidToken
+// 验证 yudao 的核心语义：网关不拦截，是否需要登录由下游判断。
+func TestAuthPassesThroughWithoutToken(t *testing.T) {
+	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("无令牌时不应调用 check-token")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer checkServer.Close()
+
+	var gotLoginUser string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLoginUser = r.Header.Get("login-user")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Auth = config.Auth{Enabled: true, BaseURL: checkServer.URL, CacheTTL: time.Minute, Timeout: 2 * time.Second}
+	})
+
+	response, _ := env.do(t, requestOptions{path: "/web/huobao/v1/dramas"})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（无令牌应放行）", response.StatusCode)
+	}
+	if gotLoginUser != "" {
+		t.Errorf("无令牌时不应注入 login-user，实际 %q", gotLoginUser)
+	}
+}
+
+func TestAuthPassesThroughOnInvalidToken(t *testing.T) {
+	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":401,"data":null,"message":"令牌已过期"}`))
+	}))
+	defer checkServer.Close()
+
+	var gotLoginUser string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLoginUser = r.Header.Get("login-user")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Auth = config.Auth{Enabled: true, BaseURL: checkServer.URL, CacheTTL: time.Minute, Timeout: 2 * time.Second}
+	})
+
+	response, _ := env.do(t, requestOptions{
+		path:    "/web/huobao/v1/dramas",
+		headers: map[string]string{contracts.HeaderAuthorization: "Bearer expired-token"},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（令牌失效应放行，由下游判断）", response.StatusCode)
+	}
+	if gotLoginUser != "" {
+		t.Errorf("令牌失效时不应注入身份，实际 %q", gotLoginUser)
+	}
+}
+
+// TestAuthFailsOpenWhenIssuerUnreachable 验证鉴权方不可用时按无身份放行，
+// 入口不因为认证链路抖动变成单点。
+func TestAuthFailsOpenWhenIssuerUnreachable(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("获取空闲端口失败: %v", err)
+	}
+	deadAuth := "http://" + listener.Addr().String()
+	listener.Close()
+
+	var gotLoginUser string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLoginUser = r.Header.Get("login-user")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Auth = config.Auth{Enabled: true, BaseURL: deadAuth, CacheTTL: time.Minute, Timeout: 500 * time.Millisecond}
+	})
+
+	response, _ := env.do(t, requestOptions{
+		path:    "/web/huobao/v1/dramas",
+		headers: map[string]string{contracts.HeaderAuthorization: "Bearer whatever"},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（鉴权方不可用应放行）", response.StatusCode)
+	}
+	if gotLoginUser != "" {
+		t.Error("鉴权失败时不应注入身份")
+	}
+}
+
+// TestAuthUsesCacheToAvoidHammeringIssuer 验证缓存生效：
+// 同一令牌重复请求只触发一次 check-token。
+func TestAuthUsesCacheToAvoidHammeringIssuer(t *testing.T) {
+	var checks atomic.Int32
+	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		checks.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"userId":42,"tenantId":7,"expiresTime":"2099-01-01T00:00:00"}}`))
+	}))
+	defer checkServer.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Auth = config.Auth{Enabled: true, BaseURL: checkServer.URL, CacheTTL: time.Minute, Timeout: 2 * time.Second}
+	})
+
+	for i := 0; i < 5; i++ {
+		response, _ := env.do(t, requestOptions{
+			path:    "/web/huobao/v1/dramas",
+			headers: map[string]string{contracts.HeaderAuthorization: "Bearer cached-token"},
+		})
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次请求状态码 = %d", i+1, response.StatusCode)
+		}
+	}
+
+	if got := checks.Load(); got != 1 {
+		t.Errorf("check-token 被调用 %d 次，期望 1（缓存未生效）", got)
 	}
 }
 

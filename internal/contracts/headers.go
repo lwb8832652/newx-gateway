@@ -19,6 +19,12 @@ const (
 	HeaderUserScope = "X-User-Scope"
 	// HeaderPrincipalID 入口注入的主体标识，用于限流与审计归类。
 	HeaderPrincipalID = "X-Principal-Id"
+	// HeaderLoginUser 是 yudao 框架约定的登录用户头：
+	// LoginUser 对象序列化为 JSON 后再 URL-encode。这是芋道私有约定，
+	// 不是 OAuth2/OIDC 标准，字段与编码方式必须与 yudao-spring-boot-starter-security 完全一致。
+	HeaderLoginUser = "login-user"
+	// HeaderTenantID 是 yudao 约定的租户头。
+	HeaderTenantID = "tenant-id"
 )
 
 // 代理与鉴权相关头。这些头客户端可以伪造，入口默认不信任。
@@ -38,11 +44,16 @@ const internalHeaderPrefix = "x-internal-"
 
 // SpoofableHeaders 是入口必须无条件剥离的客户端伪造头。
 // 剥离发生在注入之前，确保下游与日志看到的身份信息只来自入口自身。
+//
+// login-user 与 tenant-id 是 yudao 的身份约定头，同样必须剥离：
+// 否则客户端可以伪造一个 admin 身份的 login-user 直接穿透到下游服务。
 var SpoofableHeaders = []string{
 	HeaderUserID,
 	HeaderUserScope,
 	HeaderPrincipalID,
 	HeaderAppCode,
+	HeaderLoginUser,
+	HeaderTenantID,
 	HeaderForwardedFor,
 	HeaderForwardedHost,
 	HeaderForwardedProto,
