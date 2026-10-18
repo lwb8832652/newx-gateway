@@ -16,6 +16,108 @@ import (
 	"newx-gateway/internal/contracts"
 )
 
+func TestForwardDoesNotFollowRedirects(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		for _, method := range []string{http.MethodGet, http.MethodPost} {
+			t.Run(http.StatusText(status)+"/"+method, func(t *testing.T) {
+				var redirected atomic.Int32
+				destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					redirected.Add(1)
+					_, _ = io.WriteString(w, "redirected")
+				}))
+				defer destination.Close()
+				location := destination.URL + "/target?token=redirect-secret"
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Location", location)
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, "redirect response")
+				}))
+				defer upstream.Close()
+
+				p := New(Options{DefaultBudget: time.Second})
+				c := app.NewContext(0)
+				c.Request.SetRequestURI("/web/huobao/v1/start")
+				c.Request.Header.SetMethod(method)
+				c.Request.Header.Set("Authorization", "Bearer private-token")
+				c.Request.Header.Set("login-user", "private-identity")
+				c.Request.SetBodyString("private-body")
+				if err := p.Forward(context.Background(), c, Target{
+					Scheme: "http", Host: strings.TrimPrefix(upstream.URL, "http://"), Path: "/start",
+				}, "web"); err != nil {
+					t.Fatal(err)
+				}
+				if got := c.Response.StatusCode(); got != status {
+					t.Fatalf("重定向状态码 = %d，期望 %d", got, status)
+				}
+				if got := c.Response.Header.Get("Location"); got != location {
+					t.Errorf("Location = %q，期望 %q", got, location)
+				}
+				body, err := io.ReadAll(c.Response.BodyStream())
+				_ = c.Response.CloseBodyStream()
+				if err != nil || string(body) != "redirect response" {
+					t.Errorf("重定向正文 = %q，err = %v", body, err)
+				}
+				if got := redirected.Load(); got != 0 {
+					t.Errorf("网关跟随了重定向 %d 次", got)
+				}
+			})
+		}
+	}
+}
+
+func TestForwardDoesNotReplayUnsafeRequests(t *testing.T) {
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/tasks/create"},
+		{http.MethodHead, "/agent/run"},
+		{http.MethodOptions, "/merge/start"},
+		{http.MethodPost, "/dramas"},
+		{http.MethodPut, "/dramas/1"},
+		{http.MethodGet, "/upload"},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			var attempts atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/warm" {
+					_, _ = io.WriteString(w, "warm")
+					return
+				}
+				attempts.Add(1)
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+			}))
+			defer upstream.Close()
+			p := New(Options{DefaultBudget: time.Second, Rules: BudgetRules{
+				GeneratePaths: []string{"/tasks", "/agent", "/merge"}, UploadPaths: []string{"/upload"},
+			}})
+			target := Target{Scheme: "http", Host: strings.TrimPrefix(upstream.URL, "http://"), Path: "/warm"}
+			warm := app.NewContext(0)
+			warm.Request.Header.SetMethod(http.MethodGet)
+			warm.Request.SetRequestURI("/warm")
+			if err := p.Forward(context.Background(), warm, target, "web"); err != nil {
+				t.Fatalf("预热失败: %v", err)
+			}
+			if _, err := io.Copy(io.Discard, warm.Response.BodyStream()); err != nil {
+				t.Fatal(err)
+			}
+			_ = warm.Response.CloseBodyStream()
+
+			c := app.NewContext(0)
+			c.Request.Header.SetMethod(tc.method)
+			c.Request.SetRequestURI(tc.path)
+			c.Request.Header.Set("Idempotency-Key", "test-key")
+			target.Path = tc.path
+			if err := p.Forward(context.Background(), c, target, "web"); err == nil {
+				t.Fatal("下游关闭连接时应返回代理错误")
+			}
+			if got := attempts.Load(); got != 1 {
+				t.Errorf("生成/写入请求被底层重放，实际请求 %d 次", got)
+			}
+		})
+	}
+}
+
 func TestForwardDelayedStreamAfterReturn(t *testing.T) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

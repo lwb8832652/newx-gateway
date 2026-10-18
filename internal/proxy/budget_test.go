@@ -36,6 +36,9 @@ func TestKindOf(t *testing.T) {
 		{"上传类路径", "POST", "/api/v1/upload", KindUpload},
 		{"上传优先于生成", "POST", "/api/v1/upload/tasks", KindUpload},
 		{"路径大小写不敏感", "get", "/API/V1/DRAMAS", KindRead},
+		{"编码生成路径", "GET", "/web/huobao/v1/%74asks/create", KindGenerate},
+		{"编码生成 HEAD", "HEAD", "/web/huobao/v1/%61gent/run", KindGenerate},
+		{"编码上传路径", "OPTIONS", "/web/huobao/v1/%75pload", KindUpload},
 	}
 
 	for _, tc := range cases {

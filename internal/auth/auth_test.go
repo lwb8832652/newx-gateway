@@ -128,6 +128,37 @@ func validPayload() map[string]any {
 	}
 }
 
+func TestTokenClientDoesNotFollowRedirects(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var redirected atomic.Int32
+			destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				redirected.Add(1)
+				_ = json.NewEncoder(w).Encode(validPayload())
+			}))
+			defer destination.Close()
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", destination.URL+"/check?token=private-token")
+				w.WriteHeader(status)
+			}))
+			defer upstream.Close()
+			client := NewTokenClient(func(context.Context) (string, error) {
+				return upstream.URL, nil
+			}, "", time.Second)
+			for _, custom := range []*http.Client{client.HTTPClient, nil, {Timeout: time.Second}} {
+				client.HTTPClient = custom
+				user, err := client.Check(context.Background(), 1, "private-token")
+				if err == nil || user != nil {
+					t.Errorf("认证重定向必须失败且不返回身份: user=%+v err=%v", user, err)
+				}
+				if got := redirected.Load(); got != 0 {
+					t.Errorf("check-token 跟随重定向 %d 次，可能泄露凭据", got)
+				}
+			}
+		})
+	}
+}
+
 func TestTokenClientCheckSuccess(t *testing.T) {
 	server, tenantSeen := newCheckServer(t, func(accessToken string) (int, any) {
 		if accessToken != "token-abc" {

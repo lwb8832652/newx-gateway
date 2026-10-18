@@ -31,7 +31,7 @@ func Recover(logger *slog.Logger) app.HandlerFunc {
 				return
 			}
 
-			message := fmt.Sprintf("panic: %v", recovered)
+			message := "internal error"
 			if logger != nil {
 				logger.Error("panic recovered",
 					"request_id", httpx.RequestID(c),
@@ -39,7 +39,7 @@ func Recover(logger *slog.Logger) app.HandlerFunc {
 					"app_code", httpx.AppCode(c),
 					"route", httpx.Route(c),
 					"method", string(c.Method()),
-					"panic", fmt.Sprint(recovered),
+					"panic_type", fmt.Sprintf("%T", recovered),
 					"stack", string(debug.Stack()),
 				)
 			}

@@ -90,7 +90,7 @@ func (n *NacosResolver) Start(ctx context.Context) {
 				return
 			case <-ticker.C:
 				if err := n.Refresh(ctx); err != nil && n.cfg.Logger != nil {
-					n.cfg.Logger.Warn("刷新 Nacos 实例列表失败，继续使用缓存", "err", err)
+					n.cfg.Logger.Warn("刷新 Nacos 实例列表失败，继续使用缓存", "error_type", fmt.Sprintf("%T", err))
 				}
 			}
 		}
@@ -191,8 +191,7 @@ func (n *NacosResolver) fetch(ctx context.Context, service string) ([]Instance, 
 		return nil, fmt.Errorf("读取 Nacos 响应失败: %w", err)
 	}
 	if response.StatusCode != http.StatusOK {
-		// 鉴权开启时 Nacos 会返回 403；此时必须暴露原文，否则无法定位。
-		return nil, fmt.Errorf("Nacos 返回 %d: %s", response.StatusCode, truncate(string(payload), 200))
+		return nil, fmt.Errorf("Nacos 返回 %d", response.StatusCode)
 	}
 
 	var parsed nacosInstanceList
@@ -240,14 +239,6 @@ func (n *NacosResolver) Services() []string {
 		services = append(services, service)
 	}
 	return services
-}
-
-func truncate(value string, limit int) string {
-	runes := []rune(value)
-	if len(runes) <= limit {
-		return value
-	}
-	return string(runes[:limit]) + "..."
 }
 
 func joinErrors(errs []error) error {

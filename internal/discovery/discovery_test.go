@@ -3,6 +3,8 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -197,8 +199,11 @@ func TestNacosResolverParsesInstances(t *testing.T) {
 
 func TestNacosResolverFallsBackToStaleCache(t *testing.T) {
 	var fail atomic.Bool
+	var requests, failures atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
 		if fail.Load() {
+			failures.Add(1)
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"message":"forbidden"}`))
 			return
@@ -219,7 +224,11 @@ func TestNacosResolverFallsBackToStaleCache(t *testing.T) {
 		t.Fatalf("首次解析应成功: %v", err)
 	}
 
-	// 第二次解析时缓存已过期且上游故障：应降级返回旧缓存。
+	resolver.mu.Lock()
+	entry := resolver.cache["svc"]
+	entry.fetchedAt = time.Now().Add(-time.Hour)
+	resolver.cache["svc"] = entry
+	resolver.mu.Unlock()
 	fail.Store(true)
 	instances, err := resolver.Resolve(context.Background(), "svc")
 	if err != nil {
@@ -228,11 +237,22 @@ func TestNacosResolverFallsBackToStaleCache(t *testing.T) {
 	if len(instances) != 1 || instances[0].Host != "10.0.0.1" {
 		t.Errorf("降级缓存内容异常: %+v", instances)
 	}
+	if requests.Load() != 2 || failures.Load() != 1 {
+		t.Fatalf("未验证真实失败拉取: requests=%d failures=%d", requests.Load(), failures.Load())
+	}
+	fail.Store(false)
+	if _, err := resolver.Resolve(context.Background(), "svc"); err != nil {
+		t.Fatalf("上游恢复后重新拉取失败: %v", err)
+	}
+	if requests.Load() != 3 {
+		t.Error("失败拉取不应刷新缓存时间，上游恢复后必须重新拉取")
+	}
 }
 
 func TestNacosResolverFailsWhenNoCache(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "sensitive-nacos-error-body")
 	}))
 	defer server.Close()
 
@@ -243,6 +263,57 @@ func TestNacosResolverFailsWhenNoCache(t *testing.T) {
 
 	if _, err := resolver.Resolve(context.Background(), "svc"); err == nil {
 		t.Fatal("无缓存且上游失败时必须报错，否则调用方无法映射 50201")
+	} else if strings.Contains(err.Error(), "sensitive-nacos-error-body") {
+		t.Error("发现错误中不得包含 Nacos 响应正文")
+	}
+}
+
+func TestNacosRefreshLogsExcludeErrorBody(t *testing.T) {
+	const secret = "private-nacos-error-body"
+	var fail atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, secret)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"hosts": []any{}})
+	}))
+	defer server.Close()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	resolver, err := NewNacosResolver(NacosConfig{
+		Addr: strings.TrimPrefix(server.URL, "http://"), Refresh: 10 * time.Millisecond,
+		Logger: slog.New(slog.NewJSONHandler(writer, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(context.Background(), "svc"); err != nil {
+		t.Fatal(err)
+	}
+	entries := make(chan map[string]any, 1)
+	go func() {
+		var entry map[string]any
+		_ = json.NewDecoder(reader).Decode(&entry)
+		entries <- entry
+	}()
+	fail.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resolver.Start(ctx)
+	select {
+	case entry := <-entries:
+		encoded, _ := json.Marshal(entry)
+		if strings.Contains(string(encoded), secret) || entry["err"] != nil {
+			t.Fatal("后台刷新日志不得包含原始错误或响应正文")
+		}
+		if entry["error_type"] == nil || entry["level"] != "WARN" {
+			t.Fatalf("缺少安全诊断字段: %s", encoded)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("未观察到真实失败拉取的告警日志")
 	}
 }
 

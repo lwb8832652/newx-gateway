@@ -94,7 +94,14 @@ func (c *TokenClient) Check(ctx context.Context, tenantID int64, accessToken str
 		request.Header.Set("tenant-id", strconv.FormatInt(tenantID, 10))
 	}
 
-	response, err := c.HTTPClient.Do(request)
+	client := http.Client{Timeout: c.Timeout}
+	if c.HTTPClient != nil {
+		client = *c.HTTPClient
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}

@@ -218,7 +218,7 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 //   - 写方法与生成类请求一律不自动重试，由客户端带幂等键自行决定。
 func (m FamilyModule) forward(ctx context.Context, deps Deps, c *app.RequestContext, target proxy.Target, candidates []discovery.Instance) error {
 	maxAttempts := 1
-	if isIdempotent(string(c.Method())) {
+	if deps.Proxy.CanRetry(string(c.Method()), string(c.Path())) {
 		maxAttempts = 2
 	}
 
@@ -258,16 +258,6 @@ func (m FamilyModule) forward(ctx context.Context, deps Deps, c *app.RequestCont
 	}
 
 	return lastErr
-}
-
-// isIdempotent 报告该方法是否可安全重试。
-func isIdempotent(method string) bool {
-	switch strings.ToUpper(method) {
-	case "GET", "HEAD", "OPTIONS":
-		return true
-	default:
-		return false
-	}
 }
 
 // pickExcluding 从候选集中选一个未被排除的实例。

@@ -253,8 +253,7 @@ func buildAuthMiddleware(cfg *config.Config, resolver discovery.Resolver, logger
 	if logger != nil {
 		logger.Info("认证中间件已启用（yudao 方式：远程校验 + login-user 头注入）",
 			"auth_app_code", cfg.Auth.AppCode,
-			"auth_base_url", cfg.Auth.BaseURL,
-			"check_path", cfg.Auth.CheckPath,
+			"auth_static_source", cfg.Auth.BaseURL != "",
 			"cache_ttl", cfg.Auth.CacheTTL.String(),
 		)
 	}

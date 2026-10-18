@@ -1,6 +1,9 @@
 package proxy
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // 请求类型。设计文档 §6 的四级预算按请求类型划分，入口不做业务路由登记，
 // 因此用「方法 + 路径片段」把请求归到某一档。
@@ -30,6 +33,9 @@ type BudgetRules struct {
 //
 // 路径使用入口侧原始路径判断，不依赖上游改写结果，保证规则可预测。
 func KindOf(method, path string, rules BudgetRules) string {
+	if decoded, err := url.PathUnescape(path); err == nil {
+		path = decoded
+	}
 	normalized := strings.ToLower(path)
 
 	if matchAny(normalized, rules.UploadPaths) {

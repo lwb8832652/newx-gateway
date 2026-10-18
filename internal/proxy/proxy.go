@@ -90,8 +90,9 @@ func (t Target) URL() string {
 
 // Proxy 是转发器。
 type Proxy struct {
-	client *http.Client
-	opts   Options
+	client        *http.Client
+	noRetryClient *http.Client
+	opts          Options
 }
 
 // New 构建转发器。零值字段一律回落到默认值，避免调用方漏配导致行为不确定。
@@ -119,14 +120,22 @@ func New(opts Options) *Proxy {
 		DisableCompression:    true,
 	}
 
+	noRetryTransport := transport.Clone()
+	noRetryTransport.DisableKeepAlives = true
+	noRetryTransport.Protocols = new(http.Protocols)
+	noRetryTransport.Protocols.SetHTTP1(true)
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
 	return &Proxy{
 		client: &http.Client{
-			Transport: transport,
+			Transport:     transport,
+			CheckRedirect: noRedirect,
 			// 不设 Timeout：整体预算由 Forward 中的 context 控制，
 			// 否则长耗时生成请求会被客户端级超时误杀。
 			Timeout: 0,
 		},
-		opts: opts,
+		noRetryClient: &http.Client{Transport: noRetryTransport, CheckRedirect: noRedirect},
+		opts:          opts,
 	}
 }
 
@@ -171,7 +180,11 @@ func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Targ
 
 	copyRequestHeaders(request, rc, p.opts.TrustProxyHeaders)
 
-	response, err := p.client.Do(request)
+	client := p.client
+	if !p.CanRetry(method, string(rc.Path())) {
+		client = p.noRetryClient
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return classify(err)
 	}
@@ -184,6 +197,11 @@ func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Targ
 	writeResponse(rc, response)
 	transferred = true
 	return nil
+}
+
+// CanRetry 仅允许普通读取重试，生成和上传路径优先于 HTTP 方法。
+func (p *Proxy) CanRetry(method, path string) bool {
+	return KindOf(method, path, p.opts.Rules) == KindRead
 }
 
 // cancelBody 不增加缓冲或后台 goroutine；读完、读失败或 Hertz 关闭流时释放预算。

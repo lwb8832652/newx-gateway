@@ -647,6 +647,57 @@ func TestProxyRetriesIdempotentRequests(t *testing.T) {
 	}
 }
 
+func TestProxyRetryExcludesUnsafeRequests(t *testing.T) {
+	var attempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer upstream.Close()
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+		cfg.Breaker.Enabled = false
+		cfg.TimeoutRules.GeneratePaths = append(cfg.TimeoutRules.GeneratePaths, "/custom-job")
+	})
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int32
+	}{
+		{http.MethodGet, "/dramas", 2},
+		{http.MethodHead, "/dramas", 2},
+		{http.MethodOptions, "/dramas", 2},
+		{http.MethodGet, "/agent/run", 1},
+		{http.MethodHead, "/tasks/start", 1},
+		{http.MethodOptions, "/merge/start", 1},
+		{http.MethodGet, "/previs/preview", 1},
+		{http.MethodGet, "/task-queue/create", 1},
+		{http.MethodGet, "/custom-job/start", 1},
+		{http.MethodGet, "/%74asks/start", 1},
+		{http.MethodGet, "/upload", 1},
+		{http.MethodPost, "/dramas", 1},
+		{http.MethodPut, "/dramas/1", 1},
+		{http.MethodDelete, "/dramas/1", 1},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			before := attempts.Load()
+			response, _ := env.do(t, requestOptions{
+				method: tc.method, path: "/web/huobao/v1" + tc.path,
+				headers: map[string]string{"Idempotency-Key": "test-key"},
+			})
+			if response.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("状态码 = %d，期望 503", response.StatusCode)
+			}
+			if got := attempts.Load() - before; got != tc.want {
+				t.Errorf("请求次数 = %d，期望 %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestProxyDoesNotRetryNonIdempotentRequests 验证写方法不自动重试。
 func TestProxyDoesNotRetryNonIdempotentRequests(t *testing.T) {
 	var attempts atomic.Int32
@@ -1433,6 +1484,73 @@ func TestRequestLogHasFixedFields(t *testing.T) {
 	}
 	if strings.Contains(env.logs.String(), "forged") {
 		t.Error("日志中出现了被剥离的伪造头内容")
+	}
+}
+
+func TestRequestLogsExcludeSensitiveData(t *testing.T) {
+	const secret = "log-sensitive-marker"
+	for _, authStatus := range []int{http.StatusOK, http.StatusBadGateway} {
+		t.Run(http.StatusText(authStatus), func(t *testing.T) {
+			authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if authStatus != http.StatusOK {
+					w.WriteHeader(authStatus)
+					_, _ = io.WriteString(w, secret)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code": 0, "data": map[string]any{
+						"userId": 42, "userType": 1, "tenantId": 1,
+						"userInfo":    map[string]any{"nickname": secret},
+						"expiresTime": time.Now().Add(time.Hour).UnixMilli(),
+					},
+				})
+			}))
+			defer authServer.Close()
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				identity := r.Header.Get(contracts.HeaderLoginUser)
+				if authStatus == http.StatusOK {
+					user, err := auth.ParseLoginUser(identity)
+					if err != nil || user.ID != 42 || user.Info["nickname"] != secret {
+						t.Errorf("有效认证身份未注入下游: %v", err)
+					}
+				} else if identity != "" {
+					t.Error("认证失败后不得透传伪造身份")
+				}
+				_, _ = io.Copy(io.Discard, r.Body)
+				_, _ = io.WriteString(w, secret)
+			}))
+			defer upstream.Close()
+			env := startTestApp(t, func(cfg *config.Config) {
+				cfg.Apps = []config.AppConfig{{Code: "huobao", BaseURL: upstream.URL, UpstreamPath: "/api/v1"}}
+				cfg.Auth.Enabled = true
+				cfg.Auth.BaseURL = strings.Replace(authServer.URL, "://", "://"+secret+"@", 1)
+				cfg.Auth.CacheTTL = time.Minute
+				cfg.Auth.Timeout = time.Second
+			})
+			response, _ := env.do(t, requestOptions{
+				method: http.MethodPost, path: "/web/huobao/v1/dramas?token=" + secret,
+				body: secret,
+				headers: map[string]string{
+					contracts.HeaderAuthorization: "Bearer " + secret,
+					contracts.HeaderLoginUser:     secret, contracts.HeaderRequestID: "sensitive-log-check",
+				},
+			})
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("状态码 = %d，期望 200", response.StatusCode)
+			}
+			if strings.Contains(env.logs.String(), secret) {
+				t.Fatal("Token、查询参数、身份信息或请求/响应正文进入日志")
+			}
+			found := false
+			for _, entry := range env.logEntries(t) {
+				if entry["request_id"] == "sensitive-log-check" && entry["msg"] == "request" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("脱敏后仍必须保留请求关联日志")
+			}
+		})
 	}
 }
 
