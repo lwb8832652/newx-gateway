@@ -12,8 +12,11 @@ import (
 	"time"
 )
 
-// checkTokenPath 是 yudao 的令牌校验接口（OAuth2TokenCommonApi.URL_CHECK）。
-const checkTokenPath = "/system-api/oauth2/check-token"
+// checkTokenPath 是 yudao-cloud 的令牌校验接口
+// （OAuth2TokenCommonApi.URL_CHECK = /rpc-api/system/oauth2/token/check）。
+// 单体版 ruoyi-vue-pro 使用 /system-api/oauth2/check-token，需要显式配置
+// AUTH_CHECK_PATH 覆盖。
+const checkTokenPath = "/rpc-api/system/oauth2/token/check"
 
 // commonResult 是 yudao 统一响应包装：{code, data, message}。
 type commonResult struct {

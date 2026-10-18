@@ -22,6 +22,27 @@ const (
 type BudgetRules struct {
 	GeneratePaths []string
 	UploadPaths   []string
+	// StreamPaths 是流式接口（SSE、MCP 长连接）的路径片段。
+	// 命中后不套用整体超时预算，避免 AI 对话、MCP 会话被 60s 读预算截断。
+	StreamPaths []string
+}
+
+// IsStream 判断请求是否期望流式响应。
+//
+// 两种判定方式：
+//  1. 客户端声明 Accept: text/event-stream（EventSource、MCP 客户端都会带）；
+//  2. 路径命中 STREAM_PATHS（覆盖客户端不带 Accept 的旧实现，如 /sse、/mcp）。
+//
+// 只要命中一种就按流式处理：连接与响应头仍受常规预算约束，
+// 响应体读取不再有整体超时（见 Options.StreamBudget）。
+func IsStream(path, accept string, rules BudgetRules) bool {
+	if strings.Contains(strings.ToLower(accept), "text/event-stream") {
+		return true
+	}
+	if decoded, err := url.PathUnescape(path); err == nil {
+		path = decoded
+	}
+	return matchAny(strings.ToLower(path), rules.StreamPaths)
 }
 
 // KindOf 判定请求类型。

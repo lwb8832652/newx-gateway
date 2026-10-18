@@ -11,7 +11,15 @@ slog JSON 日志与 W3C traceparent 透传、伪造头剥离、统一错误出�
 按请求类型的超时分级、失败熔断、幂等重试、
 **认证（yudao 方式：远程校验 + `login-user` 头注入 + 本地缓存）**。
 
-当前范围不包括限流/生成并发控制、网关业务授权、MCP 工具实现及 OpenAPI 签名防重放。
+**yudao 行为补齐（2026-10-18）**：旧路径兼容（`LEGACY_ROUTES`，覆盖 `/admin-api/**`、
+`/app-api/**`、`/infra/ws` 等）、WebSocket 反代（101 后劫持连接双向搬运）、
+**AI SSE / MCP 长连接（响应体不设整体超时，事件实时下发）**、
+入口 CORS（预检直接返回，并与下游响应头去重）、可信代理来源头透传、
+错误体增加 yudao 兼容字段 `msg`、认证默认接口切到 yudao-cloud、
+请求体上限与读超时对齐 yudao 网关。
+
+当前范围不包括限流/生成并发控制、网关业务授权、MCP 工具实现及 OpenAPI 签名防重放；
+Knife4j 文档聚合、SkyWalking、actuator、Nacos 动态路由仍未实现（见「与 yudao-gateway 的差异」）。
 `ScopeGuard` 保持关闭；MCP 当前仅转发，OpenAPI 默认关闭。
 
 ## 技术栈
@@ -55,11 +63,16 @@ go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --alway
 | `/admin/{app_code}/v1/*` | 管理后台 | 同上（yudao 服务自带 RBAC） | 校验 app_code 后转发下游 |
 | `/mcp/{app_code}/*` | MCP Client | 同上身份解析 + MCP 超时；工具授权由下游负责 | 启用时转发；禁用时返回 `40401` |
 | `/open-api/{app_code}/v1/*` | 外部系统 | 当前未实现独立签名、防重放及配额 | **默认关闭**，返回 `40401` |
+| `LEGACY_ROUTES` 命中的旧路径 | yudao 存量前端、Spring Boot Admin | 与所在家族一致 | 原样转发，不改写路径 |
 | `/healthz` `/readyz` | 运维 | 无 | 见「健康检查」 |
 | 其他 | — | 无 | 兜底返回 `40401` |
 
 `app_code` 必须已在 `APPS` 中注册，否则返回 `40402` —— 未知前缀不会被透传到任意后端。
 方法不匹配同样走兜底 `40401`，不暴露路由表结构。
+
+配置 `LEGACY_ROUTES` 后，旧路径（如 `/admin-api/system/user/page`）会映射到注册表中的应用并
+**原样转发**；`/admin/**`、`/mcp/message` 这类会先被 `/admin/{app_code}`、`/mcp/{app_code}`
+参数段路由接住的路径，由各家族在「app_code 未注册」时回落到旧前缀匹配，匹配不到仍是 `40402`。
 
 ## 错误码
 
@@ -99,13 +112,18 @@ go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --alway
 | `ENTRY_HTTP_ADDR` | `:8080` | 监听地址 |
 | `ENTRY_ENV` | `dev` | `dev` / `production` / `test` |
 | `APPS` | `huobao=http://127.0.0.1:5679` | 应用注册表，`code=base_url`，逗号分隔 |
+| `LEGACY_ROUTES` | 空 | 旧路径兼容映射，`前缀=app_code`，逗号分隔；命中后原样转发 |
 | `MCP_ENABLED` / `OPENAPI_ENABLED` | `true` / `false` | 通道开关 |
-| `MAX_BODY_BYTES` | 1048576 | 普通请求体上限（语义层返回 `40002`） |
+| `MAX_BODY_BYTES` | 10485760 | 普通请求体上限（语义层返回 `40002`），与 yudao 网关的 10MB 对齐 |
 | `MAX_BODY_BYTES_UPLOAD` | 2147483648 | 协议层兜底上限 |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | 日志级别与格式 |
 | `READYZ_PROBE_DOWNSTREAM` | `false` | 就绪检查是否探测下游 |
 | `AUTH_ENABLED` | `false` | 开启 yudao 方式身份解析；来源及超时配置见示例 |
+| `AUTH_CHECK_PATH` | `/rpc-api/system/oauth2/token/check` | yudao-cloud 校验接口；单体版改为 `/system-api/oauth2/check-token` |
 | `TIMEOUT_READ` / `TIMEOUT_WRITE` / `TIMEOUT_GENERATE` / `TIMEOUT_UPLOAD` / `TIMEOUT_MCP` | 见示例 | 已参与转发，请求预算覆盖响应流读取 |
+| `TIMEOUT_STREAM` | `0` | SSE / MCP 长连接的整体预算，`0` 表示不设上限 |
+| `TIMEOUT_WS_HANDSHAKE` | `10s` | WebSocket 握手（建连 + 101 响应）超时 |
+| `STREAM_PATHS` | `/sse,stream,/events,/mcp` | 流式路径片段；`Accept: text/event-stream` 也会自动识别 |
 | `TIMEOUT_STATIC` | `300s` | 预留，当前没有独立静态通道分类 |
 | `RATE_*` / `MAX_CONCURRENCY_GENERATE` | 见示例 | 仅解析校验，按当前需求暂不执行限流或并发拦截 |
 
@@ -211,19 +229,55 @@ newx-gateway/
 
 灰度请求头：`version: 2.0` 命中实例 `metadata.version=2.0`；`tag: my-host` 定向到打了同标签的实例。
 
+### 旧路径兼容与 WebSocket
+
+`LEGACY_ROUTES` 把 yudao 的「路径即服务」规则映射到注册表，命中后路径与查询参数原样转发：
+
+```dotenv
+LEGACY_ROUTES=/admin-api/system=yudao-system,/admin-api/infra=yudao-infra,/app-api/system=yudao-system,/infra/ws=yudao-infra,/admin=yudao-infra
+```
+
+- 前缀做最长匹配（`/admin-api/system` 优先于 `/admin-api`），末尾斜杠会归一化。
+- `/admin/**`、`/mcp/message` 会被参数段路由先接住，此时由家族的 `UnknownApp` 兜底回落到旧前缀；
+  未命中旧前缀仍返回 `40402`，不会把未知路径透传出去。
+- WebSocket（`Upgrade: websocket`）走单独链路：与上游完成 101 握手后调用 Hertz `Hijack`，
+  把客户端连接交给双向 `io.Copy`；握手阶段保留 `Upgrade`/`Connection`/`Sec-WebSocket-*`
+  等逐跳头，且不参与重试。握手被上游拒绝时按普通响应回写。
+
+### AI SSE 与 MCP 长连接
+
+- 判定：客户端声明 `Accept: text/event-stream`，或路径命中 `STREAM_PATHS`
+  （默认 `/sse,stream,/events,/mcp`）。命中后响应体不再套用整体超时。
+- `TIMEOUT_STREAM=0` 表示不设上限；连接与响应头阶段仍用常规预算，上游不响应时按 50401 快速失败。
+- MCP 的 `Mcp-Session-Id`、`Last-Event-ID`、`Authorization` 等头原样透传，网关不解析协议内容。
+- 旧版 HTTP+SSE：`GET /sse` + `POST /mcp/message`，通过
+  `LEGACY_ROUTES=/sse=yudao-ai,/mcp/message=yudao-ai` 接入；
+  新版 Streamable HTTP：`/mcp/{app_code}` 由 MCP 家族直接转发，POST 返回的 SSE 同样不受 60s 限制。
+- 同一个服务如果既有 `/admin-api/**` 又有根路径 `/mcp`，需要两个应用编码分别配置上游前缀，
+  例如 `yudao-ai=nacos://ai-server|/admin-api` 与 `yudao-ai-mcp=nacos://ai-server|/mcp`；
+  这样 `/admin/yudao-ai/v1/ai/...` 走 `/admin-api/ai/...`，`/mcp/yudao-ai-mcp` 走 `/mcp`。
+- 响应为 `text/event-stream` 且上游未设置 `X-Accel-Buffering` 时，入口补 `X-Accel-Buffering: no`。
+
 ### 超时分级
 
 按请求类型选档（设计文档 §6）：
 
 | 类型 | 判定 | 配置 |
 | --- | --- | --- |
-| 读 | `GET`/`HEAD`/`OPTIONS` | `TIMEOUT_READ`（15s） |
+| 流式 | `Accept: text/event-stream` 或路径命中 `STREAM_PATHS` | `TIMEOUT_STREAM`（`0` = 不设上限，优先于其它档位） |
+| 读 | `GET`/`HEAD`/`OPTIONS` | `TIMEOUT_READ`（60s） |
 | 写 | 其它方法 | `TIMEOUT_WRITE`（60s） |
 | 生成 | 路径命中 `TIMEOUT_GENERATE_PATHS` | `TIMEOUT_GENERATE`（900s） |
 | 上传 | 路径命中 `TIMEOUT_UPLOAD_PATHS` | `TIMEOUT_UPLOAD`（1800s） |
-| MCP 通道 | 家族级覆盖，优先于类型 | `TIMEOUT_MCP`（60s） |
+| MCP 通道 | 家族级覆盖，优先于类型 | `TIMEOUT_MCP`（60s），但命中流式判定时改用 `TIMEOUT_STREAM` |
+| WebSocket 握手 | `Upgrade: websocket` | `TIMEOUT_WS_HANDSHAKE`（10s），只覆盖建连与 101 响应 |
 
 拨号超时独立固定为 2s：拨号失败必须快速返回 `50201`，不占用整体预算。
+
+流式请求的“不设上限”只作用于**响应体**：连接与响应头阶段仍使用常规预算，
+上游只建连不返回响应头时会按 50401 快速失败，不会永久占住连接。
+响应为 `text/event-stream` 时入口会补 `X-Accel-Buffering: no`（若上游未设置），
+避免前置 nginx 缓冲导致事件攒批。
 
 ### 失败熔断与重试
 
@@ -276,6 +330,9 @@ newx-gateway/
   其中无时区字符串按 Go 进程本地时区解释。
 - **网关不做业务授权**：是否需要登录、有没有权限，由下游服务判断；`ScopeGuard` 不启用。
 - 鉴权方用 `AUTH_APP_CODE`（APPS 应用编码，可映射不同的 Nacos 服务名）或 `AUTH_BASE_URL`（静态 HTTP/HTTPS 地址），二选一。
+- `AUTH_CHECK_PATH` 默认 `/rpc-api/system/oauth2/token/check`（yudao-cloud 的 `OAuth2TokenCommonApi.URL_CHECK`）。
+  单体版 ruoyi-vue-pro 用的是 `/system-api/oauth2/check-token`，必须显式覆盖；
+  路径写错时接口返回 `code=401`，网关会按「令牌无效」静默放行，鉴权实际不生效。
 - `tenant-id` 是客户端可选的不可信租户提示，不能据此判断用户身份；无 Token 的登录接口也能使用它。
   非法、负数及溢出值会被删除，显式 `0` 与未提供租户分别处理；有效身份以 check-token 的租户结果覆盖该头。
 - 本地正/负缓存共用 10000 项容量上限，写入时限频清理过期项，达到容量时淘汰任意一项，
@@ -288,7 +345,10 @@ newx-gateway/
 已交付：配置与契约、注册表、四类路由壳、健康检查、日志与链路、伪造头剥离、统一错误出口、
 Nacos 服务发现、随机权重负载均衡、灰度筛选、HTTP 反代（流式请求/响应、Range 透传）、
 按请求类型的超时分级、失败熔断、幂等重试、上传通道体积豁免、
-认证（yudao 方式：远程校验 + `login-user` 头注入 + 本地缓存）。
+认证（yudao 方式：远程校验 + `login-user` 头注入 + 本地缓存）、
+旧路径兼容（`LEGACY_ROUTES`）、WebSocket 反代（含握手超时）、
+AI SSE / MCP 长连接（请求侧 + 响应侧识别）、入口 CORS、可信代理来源头透传、
+`/v3/api-docs` 路径重写。
 
 当前明确不做：
 
@@ -296,6 +356,22 @@ Nacos 服务发现、随机权重负载均衡、灰度筛选、HTTP 反代（流
 - **网关业务授权**：沿用 yudao 下游授权，不启用 `ScopeGuard`，不引入本地 JWT/authstub。
 - **MCP 工具层与 OpenAPI 安全能力**：不在入口实现工具业务；MCP 仅转发，OpenAPI 默认关闭，
   启用开关本身不代表已具备签名、防重放或配额保护。
+
+### 与 yudao-gateway 的差异（截至 2026-10-18）
+
+已补齐：旧路径（`/admin-api/**`、`/app-api/**`、`/admin/**`、`/mcp/message`、`/infra/ws`）、
+WebSocket（含握手超时）、AI SSE / MCP 长连接（含响应侧识别）、入口 CORS、
+可信代理来源头、错误体 `msg`、鉴权默认接口、请求体上限与读超时、
+**`/admin-api/{module}/v3/api-docs` 重写到 `/v3/api-docs`**。
+
+仍未实现：
+
+- **Knife4j 文档聚合 UI**（`/doc.html`）：单个服务的 `/v3/api-docs`、`/v3/api-docs/swagger-config`
+  现在可以经网关访问，但网关不提供把多个服务拼在一起的聚合页面。
+- **APM / actuator**：没有 SkyWalking 段与 `/actuator/**`；可观测性依赖结构化日志。
+- **Nacos 动态路由与自注册**：`APPS`/`LEGACY_ROUTES` 变更需重启；网关自身不注册到 Nacos，
+  Spring Boot Admin 的实例列表里看不到网关。
+- **限流与生成并发**：仍只解析配置，不拦截。
 
 部署验收仍需目标环境真实 yudao 服务、有效 Token 及信任网络联调；本地模拟 check-token/Nacos、
 源码契约核对、离线 Jackson 互操作及上述真实 Nacos 发现联调均不能替代完整部署验证。

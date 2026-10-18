@@ -58,6 +58,12 @@ type Options struct {
 	// TrustProxyHeaders 决定是否写入 X-Forwarded-* 头。
 	// 只有入口前方确有可信代理时才开启，否则客户端可伪造来源 IP。
 	TrustProxyHeaders bool
+	// StreamBudget 是流式响应（SSE/MCP 长连接）的整体预算，0 表示不设上限。
+	// 连接与响应头阶段仍受常规预算约束，避免上游无响应时永久挂住。
+	StreamBudget time.Duration
+	// HandshakeTimeout 是 WebSocket 握手阶段（建连 + 101 响应）的超时。
+	// 上游只建 TCP 连接却不回 101 时必须有兜底，否则连接会一直悬挂。
+	HandshakeTimeout time.Duration
 }
 
 // Target 是上游目标。
@@ -99,6 +105,9 @@ type Proxy struct {
 func New(opts Options) *Proxy {
 	if opts.DialTimeout <= 0 {
 		opts.DialTimeout = 2 * time.Second
+	}
+	if opts.HandshakeTimeout <= 0 {
+		opts.HandshakeTimeout = 10 * time.Second
 	}
 	if opts.MaxIdleConns <= 0 {
 		opts.MaxIdleConns = 256
@@ -157,7 +166,18 @@ func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Targ
 	method := string(rc.Method())
 	path := target.Path
 	budget := p.budget(family, method, path)
-	requestCtx, cancel := context.WithTimeout(ctx, budget)
+
+	// 流式响应（SSE / MCP 长连接）的预算：
+	//   - StreamBudget > 0：按该预算限制整体时长；
+	//   - StreamBudget = 0：响应头到达后解除预算，响应体只受客户端断开约束；
+	//     连接与响应头阶段仍用常规预算兜底，避免上游只建连不响应时永久挂住。
+	streaming := IsStream(path, string(rc.Request.Header.Peek("Accept")), p.opts.Rules)
+	streamBudget := p.opts.StreamBudget
+	if streaming && streamBudget > 0 {
+		budget = streamBudget
+	}
+
+	requestCtx, cancel := newBudgetContext(ctx, budget)
 	transferred := false
 	defer func() {
 		if !transferred {
@@ -186,7 +206,20 @@ func (p *Proxy) Forward(ctx context.Context, rc *app.RequestContext, target Targ
 	}
 	response, err := client.Do(request)
 	if err != nil {
+		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+			return &Error{Code: contracts.CodeDownstreamTimeout, Err: context.DeadlineExceeded}
+		}
 		return classify(err)
+	}
+
+	// 响应头到达后解除整体预算的两种场景：
+	//  1. 请求已判定为流式且未配置流式预算；
+	//  2. 请求未判定为流式，但上游返回 text/event-stream。
+	// 第 2 种覆盖 /ai/chat/message/send-stream 这类路径不含流式关键字、
+	// 客户端也没有带 Accept: text/event-stream 的接口。
+	unlimited := (streaming && streamBudget <= 0) || (!streaming && isEventStream(response))
+	if unlimited {
+		requestCtx.disarm()
 	}
 
 	// 注意：不能在这里 defer response.Body.Close()。
@@ -306,6 +339,12 @@ func appendForwardedFor(existing, clientIP string) string {
 	return existing + ", " + clientIP
 }
 
+// isEventStream 判断上游响应是否为 SSE。
+func isEventStream(response *http.Response) bool {
+	return response != nil &&
+		strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
+}
+
 // writeResponse 原样回写上游响应。
 //
 // 响应体使用流式写出（SetBodyStream），不做整体缓冲：
@@ -321,6 +360,13 @@ func writeResponse(rc *app.RequestContext, response *http.Response) {
 		for _, value := range values {
 			rc.Response.Header.Add(key, value)
 		}
+	}
+
+	// SSE 必须关闭前置 nginx 的代理缓冲，否则事件会被攒成一批才下发，
+	// 客户端表现为「长时间无响应、随后一次性收到多条」。
+	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") &&
+		rc.Response.Header.Get("X-Accel-Buffering") == "" {
+		rc.Response.Header.Set("X-Accel-Buffering", "no")
 	}
 
 	// Content-Length 由 Hertz 根据流大小自行处理；仅在已知长度时显式声明，

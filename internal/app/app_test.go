@@ -1,8 +1,11 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -319,7 +322,7 @@ func TestAuthUsesNacosServiceAlias(t *testing.T) {
 	var checks atomic.Int32
 	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		checks.Add(1)
-		if r.URL.Path != "/system-api/oauth2/check-token" || r.Header.Get("tenant-id") != "7" {
+		if r.URL.Path != "/rpc-api/system/oauth2/token/check" || r.Header.Get("tenant-id") != "7" {
 			t.Errorf("校验请求错误: %s, tenant-id=%q", r.URL.Path, r.Header.Get("tenant-id"))
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -809,8 +812,8 @@ func TestProxyCircuitBreakerStopsHammeringFailedDownstream(t *testing.T) {
 // 校验成功 → 下游收到 login-user（JSON + URL-encode）与 tenant-id 头。
 func TestAuthInjectsYudaoLoginUserHeader(t *testing.T) {
 	checkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/system-api/oauth2/check-token" {
-			t.Errorf("校验路径 = %q，期望 /system-api/oauth2/check-token", r.URL.Path)
+		if r.URL.Path != "/rpc-api/system/oauth2/token/check" {
+			t.Errorf("校验路径 = %q，期望 /rpc-api/system/oauth2/token/check", r.URL.Path)
 		}
 		if got := r.Header.Get("tenant-id"); got != "99" {
 			t.Errorf("check-token 租户提示 = %q，期望 99", got)
@@ -833,7 +836,7 @@ func TestAuthInjectsYudaoLoginUserHeader(t *testing.T) {
 		cfg.Auth = config.Auth{
 			Enabled:   true,
 			BaseURL:   checkServer.URL,
-			CheckPath: "/system-api/oauth2/check-token",
+			CheckPath: "/rpc-api/system/oauth2/token/check",
 			CacheTTL:  time.Minute,
 			Timeout:   2 * time.Second,
 		}
@@ -1576,6 +1579,382 @@ func TestProtocolTimeoutsCoverLongRunningBudgets(t *testing.T) {
 	}
 }
 
+// TestLegacyRoutesForwardOriginalPath 验证 yudao 旧路径兼容：
+// 命中 LEGACY_ROUTES 后路径与查询参数原样转发，不做任何改写。
+func TestLegacyRoutesForwardOriginalPath(t *testing.T) {
+	var gotPath, gotQuery string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "yudao-system", BaseURL: upstream.URL}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/admin-api/system", AppCode: "yudao-system"}}
+	})
+
+	response, body := env.do(t, requestOptions{path: "/admin-api/system/user/page?pageNo=2"})
+	if response.StatusCode != http.StatusOK || string(body) != "ok" {
+		t.Fatalf("状态码 = %d，响应 = %s", response.StatusCode, body)
+	}
+	if gotPath != "/admin-api/system/user/page" {
+		t.Errorf("下游路径 = %q，期望原样保留 /admin-api/system/user/page", gotPath)
+	}
+	if gotQuery != "pageNo=2" {
+		t.Errorf("下游查询串 = %q，期望 pageNo=2", gotQuery)
+	}
+}
+
+// TestLegacyRoutesCoexistWithAdminFamily 验证旧路径 /admin/** 与新区族
+// /admin/{app_code}/v1/** 能同时注册：静态前缀优先于参数段。
+func TestLegacyRoutesCoexistWithAdminFamily(t *testing.T) {
+	var paths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{
+			Code: "yudao-system", BaseURL: upstream.URL, UpstreamPath: "/admin-api",
+		}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/admin", AppCode: "yudao-system"}}
+	})
+
+	// 旧路径（Spring Boot Admin 这类入口）原样转发。
+	if response, _ := env.do(t, requestOptions{path: "/admin/applications"}); response.StatusCode != http.StatusOK {
+		t.Fatalf("旧路径状态码 = %d，期望 200", response.StatusCode)
+	}
+	// 新路径仍然走参数段路由，并拼上 UpstreamPath。
+	if response, _ := env.do(t, requestOptions{path: "/admin/yudao-system/v1/system/user/get"}); response.StatusCode != http.StatusOK {
+		t.Fatalf("新路径状态码 = %d，期望 200", response.StatusCode)
+	}
+
+	if len(paths) != 2 || paths[0] != "/admin/applications" || paths[1] != "/admin-api/system/user/get" {
+		t.Fatalf("下游路径 = %v，期望 [/admin/applications /admin-api/system/user/get]", paths)
+	}
+}
+
+// TestCORSPreflightHandledByGateway 验证预检请求在入口直接返回，不打到下游，
+// 且允许的方法与请求头回显浏览器声明。
+func TestCORSPreflightHandledByGateway(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "yudao-system", BaseURL: upstream.URL}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/admin-api/system", AppCode: "yudao-system"}}
+	})
+
+	response, body := env.do(t, requestOptions{
+		method: http.MethodOptions,
+		path:   "/admin-api/system/user/page",
+		headers: map[string]string{
+			"Origin":                         "http://localhost:5173",
+			"Access-Control-Request-Method":  "POST",
+			"Access-Control-Request-Headers": "content-type,authorization",
+		},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("预检状态码 = %d，期望 200，响应 %s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Errorf("Allow-Origin = %q，期望回显来源", got)
+	}
+	if got := response.Header.Get("Access-Control-Allow-Methods"); got != "POST" {
+		t.Errorf("Allow-Methods = %q，期望回显 POST", got)
+	}
+	if got := response.Header.Get("Access-Control-Allow-Headers"); got != "content-type,authorization" {
+		t.Errorf("Allow-Headers = %q，期望回显请求头", got)
+	}
+	if got := response.Header.Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Allow-Credentials = %q，期望 true", got)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("预检请求打到下游 %d 次，期望 0", hits.Load())
+	}
+}
+
+// TestCORSAddedForSimpleRequest 验证普通跨域请求补响应头，
+// 且下游已给出 CORS 头时不重复添加（避免浏览器判定失败）。
+func TestCORSAddedForSimpleRequest(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/admin-api/cors/downstream" {
+			w.Header().Set("Access-Control-Allow-Origin", "http://downstream")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "yudao-system", BaseURL: upstream.URL}}
+		cfg.LegacyRoutes = []config.LegacyRoute{
+			{Prefix: "/admin-api/system", AppCode: "yudao-system"},
+			{Prefix: "/admin-api/cors", AppCode: "yudao-system"},
+		}
+	})
+
+	response, _ := env.do(t, requestOptions{
+		path:    "/admin-api/system/user/page",
+		headers: map[string]string{"Origin": "http://localhost:5173"},
+	})
+	if got := response.Header.Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Errorf("Allow-Origin = %q，期望回显来源", got)
+	}
+
+	// 下游已有 CORS 头时沿用下游值，不叠加成两个。
+	response, _ = env.do(t, requestOptions{
+		path:    "/admin-api/cors/downstream",
+		headers: map[string]string{"Origin": "http://localhost:5173"},
+	})
+	if values := response.Header.Values("Access-Control-Allow-Origin"); len(values) != 1 || values[0] != "http://downstream" {
+		t.Errorf("Allow-Origin = %v，期望只保留下游值", values)
+	}
+}
+
+// TestTrustedProxyHeadersPreserved 验证 TRUST_PROXY_HEADERS=true 时，
+// 上游代理写入的 X-Forwarded-For 不再被剥离，转发层再追加当前对端地址。
+func TestTrustedProxyHeadersPreserved(t *testing.T) {
+	var gotForwardedFor string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotForwardedFor = r.Header.Get(contracts.HeaderForwardedFor)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "yudao-system", BaseURL: upstream.URL}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/admin-api/system", AppCode: "yudao-system"}}
+		cfg.TrustProxyHeaders = true
+	})
+
+	response, _ := env.do(t, requestOptions{
+		path:    "/admin-api/system/user/page",
+		headers: map[string]string{contracts.HeaderForwardedFor: "203.0.113.9"},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", response.StatusCode)
+	}
+	if !strings.HasPrefix(gotForwardedFor, "203.0.113.9, ") {
+		t.Errorf("X-Forwarded-For = %q，期望保留客户端来源并追加入口对端地址", gotForwardedFor)
+	}
+}
+
+// TestWebSocketTunnel 验证 WebSocket 握手与 101 之后的双向字节流：
+// 网关需要保留 Upgrade/Connection 等逐跳头，并在劫持连接后原样搬运数据。
+func TestWebSocketTunnel(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("启动上游监听失败: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		request, readErr := http.ReadRequest(br)
+		if readErr != nil {
+			return
+		}
+		accept := webSocketAccept(request.Header.Get("Sec-WebSocket-Key"))
+		_, _ = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: "+accept+"\r\n\r\n")
+		// 模拟广播：把客户端发来的字节原样回显。
+		_, _ = io.Copy(conn, br)
+	}()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "yudao-infra", BaseURL: "http://" + listener.Addr().String()}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/infra/ws", AppCode: "yudao-infra"}}
+	})
+
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(env.baseURL, "http://"), 3*time.Second)
+	if err != nil {
+		t.Fatalf("连接网关失败: %v", err)
+	}
+	defer conn.Close()
+
+	_, _ = io.WriteString(conn, "GET /infra/ws?token=test HTTP/1.1\r\n"+
+		"Host: "+strings.TrimPrefix(env.baseURL, "http://")+"\r\n"+
+		"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("读取握手响应失败: %v", err)
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("握手状态码 = %d，期望 101", response.StatusCode)
+	}
+	if got := response.Header.Get("Sec-WebSocket-Accept"); got != webSocketAccept("dGhlIHNhbXBsZSBub25jZQ==") {
+		t.Errorf("Sec-WebSocket-Accept = %q，与上游不一致", got)
+	}
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("写入隧道失败: %v", err)
+	}
+	echo := make([]byte, 4)
+	if _, err := io.ReadFull(reader, echo); err != nil {
+		t.Fatalf("读取隧道回显失败: %v", err)
+	}
+	if string(echo) != "ping" {
+		t.Errorf("隧道回显 = %q，期望 ping", echo)
+	}
+}
+
+// TestSSEStreamOutlivesReadBudget 验证 AI SSE 不被读预算截断，且事件是实时下发的：
+// 上游 250ms 后才发第二条事件，远晚于 80ms 的读预算；若预算仍覆盖响应体，
+// 第二条事件会丢失，若 Hertz 缓冲则会表现为首条事件延迟到达。
+func TestSSEStreamOutlivesReadBudget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(250 * time.Millisecond)
+		_, _ = io.WriteString(w, "data: second\n\n")
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "yudao-ai", BaseURL: upstream.URL}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/sse", AppCode: "yudao-ai"}}
+		cfg.Timeouts.Read = 80 * time.Millisecond
+		cfg.Timeouts.Stream = 0
+		cfg.TimeoutRules.StreamPaths = []string{"/sse", "stream", "/events", "/mcp"}
+	})
+
+	response, err := env.client.Get(env.baseURL + "/sse")
+	if err != nil {
+		t.Fatalf("建立 SSE 连接失败: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", response.StatusCode)
+	}
+	if got := response.Header.Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("X-Accel-Buffering = %q，期望 no", got)
+	}
+
+	start := time.Now()
+	reader := bufio.NewReader(response.Body)
+	first, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("读取首条事件失败: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("首条事件延迟 %s，疑似被网关缓冲", elapsed)
+	}
+	if !strings.Contains(first, "data: first") {
+		t.Fatalf("首条事件 = %q", first)
+	}
+
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("读取后续事件失败: %v", err)
+	}
+	if !strings.Contains(string(rest), "data: second") {
+		t.Fatalf("流被截断，后续内容 = %q", rest)
+	}
+}
+
+// TestApiDocsRewrite 验证 /admin-api/{module}/v3/api-docs 会像 yudao-gateway
+// 的 RewritePath 一样剥掉业务前缀，转发到服务根路径 /v3/api-docs。
+func TestApiDocsRewrite(t *testing.T) {
+	var paths, queries []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		queries = append(queries, r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"openapi":"3.1.0"}`))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{
+			Code: "yudao-system", BaseURL: upstream.URL, UpstreamPath: "/admin-api",
+		}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/admin-api/system", AppCode: "yudao-system"}}
+	})
+
+	// 旧路径（yudao 前端/Knife4j 使用的形式）。
+	if response, body := env.do(t, requestOptions{path: "/admin-api/system/v3/api-docs?group=legacy"}); response.StatusCode != http.StatusOK {
+		t.Fatalf("旧路径文档状态码 = %d，响应 %s", response.StatusCode, body)
+	}
+	// 新路径族：先拼上 /admin-api/system，再统一重写。
+	if response, body := env.do(t, requestOptions{path: "/admin/yudao-system/v1/system/v3/api-docs?group=family"}); response.StatusCode != http.StatusOK {
+		t.Fatalf("新路径文档状态码 = %d，响应 %s", response.StatusCode, body)
+	}
+	// swagger-config 同样重写。
+	if response, body := env.do(t, requestOptions{path: "/admin-api/system/v3/api-docs/swagger-config"}); response.StatusCode != http.StatusOK {
+		t.Fatalf("swagger-config 状态码 = %d，响应 %s", response.StatusCode, body)
+	}
+
+	wantPaths := []string{"/v3/api-docs", "/v3/api-docs", "/v3/api-docs/swagger-config"}
+	wantQueries := []string{"group=legacy", "group=family", ""}
+	for i := range wantPaths {
+		if paths[i] != wantPaths[i] {
+			t.Errorf("第 %d 次下游路径 = %q，期望 %q", i+1, paths[i], wantPaths[i])
+		}
+		if queries[i] != wantQueries[i] {
+			t.Errorf("第 %d 次查询串 = %q，期望 %q", i+1, queries[i], wantQueries[i])
+		}
+	}
+}
+
+// TestLegacyMCPMessageFallback 验证 yudao 的 /mcp/message 不会被
+// /mcp/{app_code} 参数段路由吞掉，而是回落到旧路径映射。
+func TestLegacyMCPMessageFallback(t *testing.T) {
+	var gotPath, gotQuery, gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		payload, _ := io.ReadAll(r.Body)
+		gotBody = string(payload)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("accepted"))
+	}))
+	defer upstream.Close()
+
+	env := startTestApp(t, func(cfg *config.Config) {
+		cfg.Apps = []config.AppConfig{{Code: "yudao-ai", BaseURL: upstream.URL}}
+		cfg.LegacyRoutes = []config.LegacyRoute{{Prefix: "/mcp/message", AppCode: "yudao-ai"}}
+	})
+
+	response, body := env.do(t, requestOptions{
+		method: http.MethodPost,
+		path:   "/mcp/message?sessionId=abc",
+		body:   `{"jsonrpc":"2.0"}`,
+	})
+	if response.StatusCode != http.StatusAccepted || string(body) != "accepted" {
+		t.Fatalf("状态码 = %d，响应 = %s", response.StatusCode, body)
+	}
+	if gotPath != "/mcp/message" || gotQuery != "sessionId=abc" || gotBody != `{"jsonrpc":"2.0"}` {
+		t.Fatalf("下游收到 path=%q query=%q body=%q", gotPath, gotQuery, gotBody)
+	}
+}
+
+// webSocketAccept 按 RFC 6455 计算握手响应头。
+func webSocketAccept(key string) string {
+	hash := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(hash[:])
+}
+
 func testConfig(t *testing.T, mutate func(*config.Config)) *config.Config {
 	t.Helper()
 
@@ -1591,12 +1970,14 @@ func testConfig(t *testing.T, mutate func(*config.Config)) *config.Config {
 		MaxBodyBytes:       config.DefaultMaxBodyBytes,
 		MaxBodyBytesUpload: config.DefaultMaxBodyBytesUpload,
 		Timeouts: config.Timeouts{
-			Read:     config.DefaultTimeoutRead,
-			Write:    config.DefaultTimeoutWrite,
-			Generate: config.DefaultTimeoutGenerate,
-			Upload:   config.DefaultTimeoutUpload,
-			Static:   config.DefaultTimeoutStatic,
-			MCP:      config.DefaultTimeoutMCP,
+			Read:        config.DefaultTimeoutRead,
+			Write:       config.DefaultTimeoutWrite,
+			Generate:    config.DefaultTimeoutGenerate,
+			Upload:      config.DefaultTimeoutUpload,
+			Static:      config.DefaultTimeoutStatic,
+			MCP:         config.DefaultTimeoutMCP,
+			Stream:      config.DefaultTimeoutStream,
+			WSHandshake: config.DefaultWSHandshakeTimeout,
 		},
 		Rates: config.RateLimits{
 			Web:                    config.DefaultRateWeb,
@@ -1616,6 +1997,7 @@ func testConfig(t *testing.T, mutate func(*config.Config)) *config.Config {
 		TimeoutRules: config.TimeoutRules{
 			GeneratePaths: []string{"/agent", "/tasks", "/merge", "/previs", "/task-queue"},
 			UploadPaths:   []string{"/upload"},
+			StreamPaths:   []string{"/sse", "stream", "/events", "/mcp"},
 		},
 	}
 

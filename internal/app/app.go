@@ -31,6 +31,7 @@ import (
 	"newx-gateway/internal/transport"
 	"newx-gateway/internal/transport/admin"
 	"newx-gateway/internal/transport/health"
+	"newx-gateway/internal/transport/legacy"
 	"newx-gateway/internal/transport/mcp"
 	"newx-gateway/internal/transport/openapi"
 	"newx-gateway/internal/transport/web"
@@ -92,7 +93,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		middleware.Recover(logger),
 		middleware.Tracing(),
 		middleware.RequestLogger(logger),
-		middleware.HeaderGuard(),
+		// CORS 放在身份处理之前：预检请求没有凭据，直接入口返回即可，
+		// 不需要经过鉴权与下游转发。
+		middleware.CORS(),
+		middleware.HeaderGuard(cfg.TrustProxyHeaders),
 		middleware.BodyLimit(cfg.MaxBodyBytes, cfg.TimeoutRules.UploadPaths, cfg.MaxBodyBytesUpload),
 	)
 
@@ -141,8 +145,26 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		Proxy:     proxyClient,
 		Breaker:   breaker,
 	}
+	// 旧路径兼容（/admin-api/**、/app-api/** 等）默认不启用；
+	// 启用时与新区族共用同一套家族中间件，鉴权与限流语义保持一致。
+	//
+	// 除独立路由外，还要把 Fallback 挂到各家族：/admin/**、/mcp/message 这类
+	// 路径会被 /admin/{app_code}、/mcp/{app_code} 参数段路由先接住，
+	// 只有 app_code 未注册时才回落到旧前缀匹配。
+	var legacyModule transport.Module
+	if len(cfg.LegacyRoutes) > 0 {
+		module := legacy.New(cfg.LegacyRoutes)
+		module.Middlewares = familyChain(middleware.BucketAdmin)
+		fallbackHandler := module.Fallback(deps)
+		webModule.UnknownApp = fallbackHandler
+		adminModule.UnknownApp = fallbackHandler
+		mcpModule.UnknownApp = fallbackHandler
+		openAPIModule.UnknownApp = fallbackHandler
+		legacyModule = module
+	}
+
 	modules := transport.Register(h, deps,
-		webModule, adminModule, mcpModule, openAPIModule, healthModule,
+		legacyModule, webModule, adminModule, mcpModule, openAPIModule, healthModule,
 	)
 
 	fallback := transport.NoRouteHandler()
@@ -339,8 +361,15 @@ func proxyOptions(cfg *config.Config) proxy.Options {
 			"family:" + contracts.FamilyMCP:     cfg.Timeouts.MCP,
 			"family:" + contracts.FamilyOpenAPI: cfg.Timeouts.Write,
 		},
-		DefaultBudget:       cfg.Timeouts.Write,
-		Rules:               proxy.BudgetRules{GeneratePaths: cfg.TimeoutRules.GeneratePaths, UploadPaths: cfg.TimeoutRules.UploadPaths},
+		DefaultBudget: cfg.Timeouts.Write,
+		Rules: proxy.BudgetRules{
+			GeneratePaths: cfg.TimeoutRules.GeneratePaths,
+			UploadPaths:   cfg.TimeoutRules.UploadPaths,
+			StreamPaths:   cfg.TimeoutRules.StreamPaths,
+		},
+		// 0 表示流式响应体不设超时，连接与响应头阶段仍走常规预算。
+		StreamBudget:        cfg.Timeouts.Stream,
+		HandshakeTimeout:    cfg.Timeouts.WSHandshake,
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 64,
 		TrustProxyHeaders:   cfg.TrustProxyHeaders,

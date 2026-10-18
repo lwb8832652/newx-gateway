@@ -72,6 +72,10 @@ type FamilyModule struct {
 	// Middlewares 是家族级中间件（鉴权、范围校验、限流），由装配层注入，
 	// 顺序即调用顺序，最后总是家族处理器。
 	Middlewares []app.HandlerFunc
+	// UnknownApp 在 app_code 未注册时兜底（用于 yudao 旧路径兼容：
+	// /admin/**、/mcp/message 这类路径会被参数段路由先接住）。
+	// 为空时按「应用不存在」返回 40402。
+	UnknownApp app.HandlerFunc
 }
 
 // Name 实现 Module。
@@ -118,93 +122,108 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 
 		registered, found := deps.Registry.Lookup(appCode)
 		if !found {
+			// 未注册时先交给旧路径兜底（/admin/**、/mcp/message 等会被
+			// 参数段路由先接住）；兜底也没有匹配再按未注册应用拒绝。
+			if m.UnknownApp != nil {
+				m.UnknownApp(ctx, c)
+				return
+			}
 			// 未注册的应用一律拒绝：避免未知前缀被透传到任意后端。
 			httpx.WriteError(c, contracts.CodeAppNotFound)
 			return
 		}
 
-		c.Set(contracts.CtxAppCode, registered.Code)
-		c.Set(contracts.CtxDownstream, registered.Code)
-		c.Request.Header.Set(contracts.HeaderAppCode, registered.Code)
+		Serve(ctx, deps, c, registered, joinPath(registered.UpstreamPath, rest), m.Family)
+	}
+}
 
-		if !registered.Routable() || deps.Discovery == nil || deps.Proxy == nil {
-			// 已注册但下游来源缺失：与「未实现」区分，表示配置不完整。
-			httpx.WriteError(c, contracts.CodeDownstreamRefused)
-			return
-		}
+// Serve 把已注册应用转发到下游：解析实例 → 灰度筛选 → 熔断摘除 → 转发。
+//
+// targetPath 是写给下游的完整路径：新路径族由 FamilyModule 解析后拼出，
+// 旧路径兼容映射直接传原始路径。两条入口共用同一套实例解析、灰度、熔断与
+// 错误分类，避免出现「新路径能用、旧路径行为不一致」的第二套语义。
+func Serve(ctx context.Context, deps Deps, c *app.RequestContext, registered registry.App, targetPath, family string) {
+	c.Set(contracts.CtxAppCode, registered.Code)
+	c.Set(contracts.CtxDownstream, registered.Code)
+	c.Request.Header.Set(contracts.HeaderAppCode, registered.Code)
 
-		instances, err := deps.Discovery.Resolve(ctx, registered.Code)
-		if err != nil {
-			if deps.Logger != nil {
-				deps.Logger.Warn("解析下游实例失败",
-					"app_code", registered.Code,
-					"request_id", httpx.RequestID(c),
-					"err", err,
-				)
-			}
-			httpx.WriteError(c, contracts.CodeDownstreamRefused)
-			return
-		}
+	if !registered.Routable() || deps.Discovery == nil || deps.Proxy == nil {
+		// 已注册但下游来源缺失：与「未实现」区分，表示配置不完整。
+		httpx.WriteError(c, contracts.CodeDownstreamRefused)
+		return
+	}
 
-		// 灰度筛选：请求头 version / tag，语义与 yudao 网关保持一致。
-		requestVersion := c.Request.Header.Get("version")
-		requestTag := c.Request.Header.Get("tag")
-		candidates, fellBack := lb.FilterGray(instances, requestVersion, requestTag)
-		if fellBack && deps.Logger != nil {
-			deps.Logger.Warn("灰度筛选无匹配实例，已回退全量",
+	instances, err := deps.Discovery.Resolve(ctx, registered.Code)
+	if err != nil {
+		if deps.Logger != nil {
+			deps.Logger.Warn("解析下游实例失败",
 				"app_code", registered.Code,
-				"version", requestVersion,
-				"tag", requestTag,
+				"request_id", httpx.RequestID(c),
+				"err", err,
 			)
 		}
+		httpx.WriteError(c, contracts.CodeDownstreamRefused)
+		return
+	}
 
-		// 摘除熔断中的实例。全部实例都处于熔断状态时直接快速失败：
-		// 继续把请求发给已知故障的下游只会白占连接、拖慢客户端，
-		// 而熔断冷却结束后 Allow 会自动放行试探请求，流量自行恢复。
-		if deps.Breaker != nil {
-			available := deps.Breaker.Available(candidates)
-			if len(available) == 0 {
-				httpx.WriteError(c, contracts.CodeDownstreamRefused)
-				return
-			}
-			candidates = available
-		}
+	// 灰度筛选：请求头 version / tag，语义与 yudao 网关保持一致。
+	requestVersion := c.Request.Header.Get("version")
+	requestTag := c.Request.Header.Get("tag")
+	candidates, fellBack := lb.FilterGray(instances, requestVersion, requestTag)
+	if fellBack && deps.Logger != nil {
+		deps.Logger.Warn("灰度筛选无匹配实例，已回退全量",
+			"app_code", registered.Code,
+			"version", requestVersion,
+			"tag", requestTag,
+		)
+	}
 
-		if len(candidates) == 0 {
+	// 摘除熔断中的实例。全部实例都处于熔断状态时直接快速失败：
+	// 继续把请求发给已知故障的下游只会白占连接、拖慢客户端，
+	// 而熔断冷却结束后 Allow 会自动放行试探请求，流量自行恢复。
+	if deps.Breaker != nil {
+		available := deps.Breaker.Available(candidates)
+		if len(available) == 0 {
 			httpx.WriteError(c, contracts.CodeDownstreamRefused)
 			return
 		}
+		candidates = available
+	}
 
-		target := proxy.Target{
-			Scheme:   candidates[0].Scheme,
-			Host:     candidates[0].Address(),
-			Path:     joinPath(registered.UpstreamPath, rest),
-			RawQuery: string(c.Request.URI().QueryString()),
-		}
+	if len(candidates) == 0 {
+		httpx.WriteError(c, contracts.CodeDownstreamRefused)
+		return
+	}
 
-		if err := m.forward(ctx, deps, c, target, candidates); err != nil {
-			var proxyErr *proxy.Error
-			if errors.As(err, &proxyErr) {
-				httpx.WriteError(c, proxyErr.Code)
-				return
-			}
-			httpx.WriteError(c, contracts.CodeDownstreamBad)
+	target := proxy.Target{
+		Scheme:   candidates[0].Scheme,
+		Host:     candidates[0].Address(),
+		Path:     rewriteApiDocs(targetPath),
+		RawQuery: string(c.Request.URI().QueryString()),
+	}
+
+	if err := forwardTo(ctx, deps, c, target, candidates, family); err != nil {
+		var proxyErr *proxy.Error
+		if errors.As(err, &proxyErr) {
+			httpx.WriteError(c, proxyErr.Code)
 			return
 		}
+		httpx.WriteError(c, contracts.CodeDownstreamBad)
+		return
+	}
 
-		// 下游 5xx：响应体仍原样透传（客户端的错误处理不被入口破坏），
-		// 但错误码归类记为 50202，供日志与告警识别；
-		// 同时计入实例失败，让熔断器能把持续报错的下游摘掉。
-		upstream := httpx.String(c, contracts.CtxUpstreamHost)
-		switch {
-		case c.Response.StatusCode() >= 500:
-			c.Set(contracts.CtxDownstreamErrorCode, int(contracts.CodeDownstreamBad))
-			if upstream != "" {
-				deps.Breaker.RecordFailure(upstream)
-			}
-		case upstream != "":
-			deps.Breaker.RecordSuccess(upstream)
+	// 下游 5xx：响应体仍原样透传（客户端的错误处理不被入口破坏），
+	// 但错误码归类记为 50202，供日志与告警识别；
+	// 同时计入实例失败，让熔断器能把持续报错的下游摘掉。
+	upstream := httpx.String(c, contracts.CtxUpstreamHost)
+	switch {
+	case c.Response.StatusCode() >= 500:
+		c.Set(contracts.CtxDownstreamErrorCode, int(contracts.CodeDownstreamBad))
+		if upstream != "" {
+			deps.Breaker.RecordFailure(upstream)
 		}
+	case upstream != "":
+		deps.Breaker.RecordSuccess(upstream)
 	}
 }
 
@@ -216,7 +235,26 @@ func (m FamilyModule) handler(deps Deps) app.HandlerFunc {
 //     重试不会产生重复响应；
 //   - 重试必须换一个实例，否则只是把同样的失败再演一遍；
 //   - 写方法与生成类请求一律不自动重试，由客户端带幂等键自行决定。
-func (m FamilyModule) forward(ctx context.Context, deps Deps, c *app.RequestContext, target proxy.Target, candidates []discovery.Instance) error {
+func forwardTo(ctx context.Context, deps Deps, c *app.RequestContext, target proxy.Target, candidates []discovery.Instance, family string) error {
+	// WebSocket 是长连接：先与上游完成 101 握手，再劫持客户端连接做双向字节搬运。
+	// 它不能参与下面的重试——握手一旦写给某个实例，就不能换个实例重放，
+	// 否则会出现「上游已经建链、客户端又收到另一个实例响应」的错乱。
+	if isWebSocketUpgrade(c) {
+		chosen, ok := pickExcluding(candidates, nil)
+		if !ok {
+			return &proxy.Error{Code: contracts.CodeDownstreamRefused, Err: errors.New("没有可用实例")}
+		}
+		target.Scheme = chosen.Scheme
+		target.Host = chosen.Address()
+		c.Set(contracts.CtxUpstreamHost, chosen.Address())
+
+		err := deps.Proxy.ForwardWebSocket(ctx, c, target)
+		if err != nil && deps.Breaker != nil {
+			deps.Breaker.RecordFailure(chosen.Address())
+		}
+		return err
+	}
+
 	maxAttempts := 1
 	if deps.Proxy.CanRetry(string(c.Method()), string(c.Path())) {
 		maxAttempts = 2
@@ -235,7 +273,7 @@ func (m FamilyModule) forward(ctx context.Context, deps Deps, c *app.RequestCont
 		target.Host = chosen.Address()
 		c.Set(contracts.CtxUpstreamHost, chosen.Address())
 
-		lastErr = deps.Proxy.Forward(ctx, c, target, m.Family)
+		lastErr = deps.Proxy.Forward(ctx, c, target, family)
 
 		if lastErr != nil {
 			// 传输层失败：记入实例失败，供熔断器摘除。
@@ -278,6 +316,35 @@ func pickExcluding(candidates []discovery.Instance, excluded map[string]bool) (d
 	}
 	return lb.Pick(remaining)
 }
+
+// isWebSocketUpgrade 判断是否为 WebSocket 握手请求。
+// 只认 RFC 6455 的标准组合：Upgrade: websocket + Connection 含 upgrade。
+func isWebSocketUpgrade(c *app.RequestContext) bool {
+	if !strings.EqualFold(strings.TrimSpace(string(c.Request.Header.Peek("Upgrade"))), "websocket") {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(c.Request.Header.Peek("Connection"))), "upgrade")
+}
+
+// rewriteApiDocs 对齐 yudao-gateway 的 RewritePath：
+// /admin-api/system/v3/api-docs → /v3/api-docs。
+//
+// 各服务由 springdoc 在根路径暴露文档，业务前缀只存在于入口；
+// 不做重写时请求会落到业务 Controller 的鉴权链上，返回「账号未登录」。
+// 只处理精确后缀，避免误伤业务里恰好包含 v3/api-docs 的普通接口。
+func rewriteApiDocs(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/v3/api-docs/swagger-config"):
+		return "/v3/api-docs/swagger-config"
+	case strings.HasSuffix(path, "/v3/api-docs"):
+		return "/v3/api-docs"
+	default:
+		return path
+	}
+}
+
+// OriginalPath 返回客户端原始请求路径（保留百分号编码），供旧路径兼容复用。
+func OriginalPath(c *app.RequestContext) string { return originalPath(c) }
 
 // originalPath 返回客户端原始请求路径（保留百分号编码）。
 func originalPath(c *app.RequestContext) string {

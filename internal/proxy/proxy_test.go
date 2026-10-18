@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -150,6 +151,169 @@ func TestForwardDelayedStreamAfterReturn(t *testing.T) {
 	}
 	if string(body) != "data: first\n\ndata: second\n\n" {
 		t.Fatalf("truncated stream: %q", body)
+	}
+}
+
+// TestForwardStreamSkipsOverallBudget 验证流式响应（SSE / MCP）不被整体预算截断：
+// 路径命中 STREAM_PATHS 或请求声明 Accept: text/event-stream 时，
+// 响应头到达后停止计时，只受客户端断开约束。
+func TestForwardStreamSkipsOverallBudget(t *testing.T) {
+	cases := []struct {
+		name   string
+		path   string
+		accept string
+	}{
+		{name: "path-rule", path: "/sse"},
+		{name: "accept-header", path: "/admin-api/ai/chat", accept: "text/event-stream"},
+		{name: "mcp-path", path: "/mcp/yudao-ai", accept: "application/json, text/event-stream"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "data: first\n\n")
+				w.(http.Flusher).Flush()
+				// 超过 DefaultBudget 后再发第二条：若预算仍覆盖响应体，这里会读失败。
+				time.Sleep(250 * time.Millisecond)
+				_, _ = io.WriteString(w, "data: second\n\n")
+			}))
+			defer upstream.Close()
+
+			p := New(Options{
+				DefaultBudget: 80 * time.Millisecond,
+				StreamBudget:  0,
+				Rules:         BudgetRules{StreamPaths: []string{"/sse", "/mcp"}},
+			})
+			defer p.client.CloseIdleConnections()
+
+			rc := newProxyContext()
+			rc.Request.SetRequestURI(tc.path)
+			if tc.accept != "" {
+				rc.Request.Header.Set("Accept", tc.accept)
+			}
+			target := Target{Host: strings.TrimPrefix(upstream.URL, "http://"), Path: tc.path}
+			if err := p.Forward(context.Background(), rc, target, "web"); err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(rc.Response.BodyStream())
+			if err != nil {
+				t.Fatalf("读取流失败: %v", err)
+			}
+			if !strings.Contains(string(body), "data: first") || !strings.Contains(string(body), "data: second") {
+				t.Fatalf("流被截断: %q", body)
+			}
+			if got := rc.Response.Header.Get("X-Accel-Buffering"); got != "no" {
+				t.Errorf("X-Accel-Buffering = %q，期望 no", got)
+			}
+		})
+	}
+}
+
+// TestForwardResponseDetectedSSEStopsBudget 覆盖「请求侧没识别出流式，
+// 但响应头是 text/event-stream」的场景：响应头到达后必须解除预算，
+// 否则 /ai/chat/message/send-stream 这类路径仍会被 60s 截断。
+func TestForwardResponseDetectedSSEStopsBudget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(250 * time.Millisecond)
+		_, _ = io.WriteString(w, "data: second\n\n")
+	}))
+	defer upstream.Close()
+
+	// 路径不含 stream/sse/mcp 关键字，请求也不带 Accept，只能靠响应头识别。
+	p := New(Options{DefaultBudget: 80 * time.Millisecond})
+	defer p.client.CloseIdleConnections()
+
+	rc := newProxyContext()
+	rc.Request.SetRequestURI("/chatdata")
+	if err := p.Forward(context.Background(), rc, Target{
+		Host: strings.TrimPrefix(upstream.URL, "http://"),
+		Path: "/chatdata",
+	}, "web"); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := io.ReadAll(rc.Response.BodyStream())
+	if err != nil {
+		t.Fatalf("读取流失败: %v", err)
+	}
+	if !strings.Contains(string(body), "data: first") || !strings.Contains(string(body), "data: second") {
+		t.Fatalf("响应侧 SSE 被预算截断: %q", body)
+	}
+}
+
+// TestForwardWebSocketHandshakeTimeout 验证上游只建 TCP 连接、不回 101 时，
+// 握手阶段会按 TIMEOUT_WS_HANDSHAKE 返回 50401，而不是永久悬挂。
+func TestForwardWebSocketHandshakeTimeout(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("启动监听失败: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		// 故意不读请求、不返回 101，模拟「TCP 通但应用层不响应」。
+		time.Sleep(time.Second)
+		_ = conn.Close()
+	}()
+
+	p := New(Options{DialTimeout: 200 * time.Millisecond, HandshakeTimeout: 100 * time.Millisecond})
+	rc := newProxyContext()
+	rc.Request.SetRequestURI("/infra/ws")
+	rc.Request.Header.Set("Upgrade", "websocket")
+	rc.Request.Header.Set("Connection", "Upgrade")
+	rc.Request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	rc.Request.Header.Set("Sec-WebSocket-Version", "13")
+
+	start := time.Now()
+	err = p.ForwardWebSocket(context.Background(), rc, Target{
+		Host: listener.Addr().String(),
+		Path: "/infra/ws",
+	})
+	var proxyErr *Error
+	if !errors.As(err, &proxyErr) || proxyErr.Code != contracts.CodeDownstreamTimeout {
+		t.Fatalf("错误 = %v，期望握手超时 50401", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("握手超时耗时 %s，未按 100ms 生效", elapsed)
+	}
+}
+
+// TestForwardStreamHeaderPhaseStillBudgeted 验证「无限流」只在响应头到达后成立：
+// 上游迟迟不返回响应头时仍按常规预算快速失败，不会永久占住连接。
+func TestForwardStreamHeaderPhaseStillBudgeted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := New(Options{
+		DefaultBudget: 80 * time.Millisecond,
+		StreamBudget:  0,
+		Rules:         BudgetRules{StreamPaths: []string{"/sse"}},
+	})
+	defer p.client.CloseIdleConnections()
+
+	rc := newProxyContext()
+	rc.Request.SetRequestURI("/sse")
+	err := p.Forward(context.Background(), rc, Target{
+		Host: strings.TrimPrefix(upstream.URL, "http://"),
+		Path: "/sse",
+	}, "web")
+
+	var proxyErr *Error
+	if !errors.As(err, &proxyErr) || proxyErr.Code != contracts.CodeDownstreamTimeout {
+		t.Fatalf("错误 = %v，期望 50401", err)
 	}
 }
 

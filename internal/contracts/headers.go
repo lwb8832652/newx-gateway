@@ -75,6 +75,18 @@ func IsSpoofableHeader(name string) bool {
 	return false
 }
 
+// forwardedHeaders 是在可信代理场景下允许继续透传的来源标识头。
+// 只有 TRUST_PROXY_HEADERS=true（入口前方确有可信代理）时才放行。
+var forwardedHeaders = map[string]bool{
+	strings.ToLower(HeaderForwardedFor):   true,
+	strings.ToLower(HeaderForwardedHost):  true,
+	strings.ToLower(HeaderForwardedProto): true,
+	strings.ToLower(HeaderRealIP):         true,
+}
+
+// IsForwardedHeader 判断是否为来源标识头（X-Forwarded-* / X-Real-Ip）。
+func IsForwardedHeader(name string) bool { return forwardedHeaders[strings.ToLower(name)] }
+
 // IsSensitiveHeader 判断某个请求头是否禁止写入日志。
 func IsSensitiveHeader(name string) bool {
 	switch strings.ToLower(name) {

@@ -313,6 +313,78 @@ func TestLoadEnvFileMissingFile(t *testing.T) {
 	}
 }
 
+func TestStreamConfig(t *testing.T) {
+	cfg, err := LoadFrom(newLookup(map[string]string{
+		"TIMEOUT_STREAM": "0",
+		"STREAM_PATHS":   "/sse,/mcp",
+	}))
+	if err != nil {
+		t.Fatalf("流式配置应加载成功: %v", err)
+	}
+	if cfg.Timeouts.Stream != 0 {
+		t.Errorf("Timeouts.Stream = %s，期望 0（不设上限）", cfg.Timeouts.Stream)
+	}
+	if len(cfg.TimeoutRules.StreamPaths) != 2 {
+		t.Fatalf("StreamPaths = %v，期望 2 条", cfg.TimeoutRules.StreamPaths)
+	}
+
+	// 负数会让流式请求立即超时，必须在启动期拒绝。
+	if _, err := LoadFrom(newLookup(map[string]string{
+		"TIMEOUT_STREAM": "-1s",
+		"STREAM_PATHS":   "/sse",
+	})); err == nil || !strings.Contains(err.Error(), "TIMEOUT_STREAM 不能为负数") {
+		t.Fatalf("负数 TIMEOUT_STREAM 应报错，实际 %v", err)
+	}
+}
+
+func TestLoadLegacyRoutes(t *testing.T) {
+	cfg, err := LoadFrom(newLookup(map[string]string{
+		"APPS":          "yudao-system=http://127.0.0.1:48081,yudao-infra=http://127.0.0.1:48082",
+		"LEGACY_ROUTES": "/admin-api/system=yudao-system,/app-api/system=yudao-system; /infra/ws/=yudao-infra",
+	}))
+	if err != nil {
+		t.Fatalf("旧路径配置应加载成功: %v", err)
+	}
+	if len(cfg.LegacyRoutes) != 3 {
+		t.Fatalf("LegacyRoutes = %+v，期望 3 条", cfg.LegacyRoutes)
+	}
+	if cfg.LegacyRoutes[0].Prefix != "/admin-api/system" || cfg.LegacyRoutes[0].AppCode != "yudao-system" {
+		t.Errorf("首条映射 = %+v", cfg.LegacyRoutes[0])
+	}
+	// 末尾斜杠会被归一化，避免注册出 /infra/ws/ 这种重复路由。
+	if cfg.LegacyRoutes[2].Prefix != "/infra/ws" {
+		t.Errorf("末尾斜杠未归一化: %q", cfg.LegacyRoutes[2].Prefix)
+	}
+}
+
+func TestLegacyRoutesValidation(t *testing.T) {
+	base := func(legacy string) map[string]string {
+		return map[string]string{
+			"APPS":          "yudao-system=http://127.0.0.1:48081",
+			"LEGACY_ROUTES": legacy,
+		}
+	}
+	cases := []struct {
+		name   string
+		legacy string
+		expect string
+	}{
+		{"应用不存在", "/admin-api/system=not-registered", "不在 APPS 注册表中"},
+		{"前缀重复", "/admin-api/system=yudao-system,/admin-api/system=yudao-system", "前缀重复"},
+		{"缺少斜杠", "admin-api/system=yudao-system", "必须以 / 开头"},
+		{"根路径", "/=yudao-system", "不能是根路径"},
+		{"语法错误", "/admin-api/system", "语法应为"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadFrom(newLookup(base(tc.legacy)))
+			if err == nil || !strings.Contains(err.Error(), tc.expect) {
+				t.Fatalf("期望错误包含 %q，实际 %v", tc.expect, err)
+			}
+		})
+	}
+}
+
 func TestDurationAndIntHelpersRespectFallback(t *testing.T) {
 	var errs []error
 	reader := envReader{lookup: newLookup(map[string]string{})}

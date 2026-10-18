@@ -14,6 +14,34 @@ func testRules() BudgetRules {
 	return BudgetRules{
 		GeneratePaths: []string{"/agent", "/tasks", "/merge", "/previs", "/task-queue"},
 		UploadPaths:   []string{"/upload"},
+		StreamPaths:   []string{"/sse", "stream", "/events", "/mcp"},
+	}
+}
+
+func TestIsStream(t *testing.T) {
+	rules := testRules()
+	cases := []struct {
+		name   string
+		path   string
+		accept string
+		want   bool
+	}{
+		{"SSE 路径", "/sse", "", true},
+		{"AI 流式路径", "/admin-api/ai/chat/stream", "application/json", true},
+		{"AI send-stream 路径", "/admin-api/ai/chat/message/send-stream", "application/json", true},
+		{"MCP 路径", "/mcp/yudao-ai", "application/json", true},
+		{"Accept 声明", "/admin-api/ai/chat", "text/event-stream", true},
+		{"Accept 列表包含", "/admin-api/ai/chat", "application/json, text/event-stream", true},
+		{"百分号编码路径", "/admin-api/ai/chat/%73tream", "", true},
+		{"普通后台接口", "/admin-api/system/user/page", "application/json", false},
+		{"普通 GET", "/admin-api/system/user/get", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsStream(tc.path, tc.accept, rules); got != tc.want {
+				t.Fatalf("IsStream(%q, %q) = %v，期望 %v", tc.path, tc.accept, got, tc.want)
+			}
+		})
 	}
 }
 

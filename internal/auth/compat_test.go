@@ -123,7 +123,7 @@ func TestHeaderGuardAndAuthTenantBoundary(t *testing.T) {
 		if tc.token != "" {
 			c.Request.Header.Set(contracts.HeaderAuthorization, "Bearer "+tc.token)
 		}
-		middleware.HeaderGuard()(context.Background(), c)
+		middleware.HeaderGuard(false)(context.Background(), c)
 		svc.Middleware()(context.Background(), c)
 		if got := c.Request.Header.Get(contracts.HeaderTenantID); got != tc.wantTenant {
 			t.Errorf("tenant %s token %s: got %q", tc.tenant, tc.token, got)

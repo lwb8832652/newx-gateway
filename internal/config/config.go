@@ -33,23 +33,35 @@ const (
 
 // 默认值。修改默认值必须同步更新 .env.example 与 README。
 const (
-	DefaultHTTPAddr            = ":8080"
-	DefaultEnv                 = EnvDev
-	DefaultMCPEnabled          = true
-	DefaultOpenAPIEnabled      = false
-	DefaultMaxBodyBytes        = 1 << 20
-	DefaultMaxBodyBytesUpload  = 2 << 30
-	DefaultLogLevel            = "info"
-	DefaultLogFormat           = LogFormatJSON
-	DefaultExitWaitTime        = 10 * time.Second
-	DefaultHuobaoBaseURL       = "http://127.0.0.1:5679"
-	DefaultAuthIssuerBaseURL   = "http://127.0.0.1:9099"
-	DefaultTimeoutRead         = 15 * time.Second
-	DefaultTimeoutWrite        = 60 * time.Second
-	DefaultTimeoutGenerate     = 900 * time.Second
-	DefaultTimeoutUpload       = 1800 * time.Second
-	DefaultTimeoutStatic       = 300 * time.Second
-	DefaultTimeoutMCP          = 60 * time.Second
+	DefaultHTTPAddr       = ":8080"
+	DefaultEnv            = EnvDev
+	DefaultMCPEnabled     = true
+	DefaultOpenAPIEnabled = false
+	// DefaultMaxBodyBytes 与 yudao-gateway 的 max-in-memory-size 对齐：
+	// 后台的批量导入、代码生成等 JSON 请求体可能超过 1MB，
+	// 收紧到 1MB 会把正常业务请求挡在入口（返回 40002）。
+	DefaultMaxBodyBytes       = 10 << 20
+	DefaultMaxBodyBytesUpload = 2 << 30
+	DefaultLogLevel           = "info"
+	DefaultLogFormat          = LogFormatJSON
+	DefaultExitWaitTime       = 10 * time.Second
+	DefaultHuobaoBaseURL      = "http://127.0.0.1:5679"
+	DefaultAuthIssuerBaseURL  = "http://127.0.0.1:9099"
+	// DefaultTimeoutRead 比最初的 15s 放宽：yudao 网关不设响应超时，
+	// 后台导出、文件下载、长轮询都走 GET，15s 会在业务返回前先 504。
+	DefaultTimeoutRead     = 60 * time.Second
+	DefaultTimeoutWrite    = 60 * time.Second
+	DefaultTimeoutGenerate = 900 * time.Second
+	DefaultTimeoutUpload   = 1800 * time.Second
+	DefaultTimeoutStatic   = 300 * time.Second
+	DefaultTimeoutMCP      = 60 * time.Second
+	// DefaultTimeoutStream 是流式响应（SSE/MCP 长连接）的整体预算，
+	// 0 表示不设上限：AI 对话与 MCP 会话可能持续数小时。
+	// 连接与响应头阶段仍受读/写预算约束，不会因为上游不响应而永久挂住。
+	DefaultTimeoutStream = time.Duration(0)
+	// DefaultWSHandshakeTimeout 是 WebSocket 握手（建连 + 101 响应）的超时。
+	// 上游只建 TCP 连接却不回 101 时，必须有兜底，否则连接会一直悬挂。
+	DefaultWSHandshakeTimeout  = 10 * time.Second
 	DefaultRateWeb             = 120
 	DefaultRateWebGenerate     = 10
 	DefaultRateAdmin           = 300
@@ -63,17 +75,39 @@ const (
 	DefaultBreakerThreshold    = 5
 	DefaultBreakerCooldown     = 10 * time.Second
 	// DefaultAuthCacheTTL 与 yudao 网关的 Guava 缓存时长保持一致。
-	DefaultAuthCacheTTL  = time.Minute
-	DefaultAuthTimeout   = 3 * time.Second
-	DefaultAuthCheckPath = "/system-api/oauth2/check-token"
+	DefaultAuthCacheTTL = time.Minute
+	DefaultAuthTimeout  = 3 * time.Second
+	// DefaultAuthCheckPath 是 yudao-cloud 的令牌校验接口
+	// （OAuth2TokenCommonApi.URL_CHECK = /rpc-api/system/oauth2/token/check）。
+	// 单体版 ruoyi-vue-pro 的 /system-api/oauth2/check-token 需显式覆盖。
+	DefaultAuthCheckPath = "/rpc-api/system/oauth2/token/check"
 	DefaultAuthEnabled   = false
 	// DefaultGeneratePaths 与 DefaultUploadPaths 对应设计文档 §6 的预算分类。
-	DefaultGeneratePaths = "/agent,/tasks,/merge,/previs,/task-queue"
+	// /export、/download 覆盖 yudao 后台的导出与文件下载：它们是 GET，
+	// 但耗时远超普通读请求，必须走长预算，否则会被 504 截断。
+	DefaultGeneratePaths = "/agent,/tasks,/merge,/previs,/task-queue,/export,/download"
 	DefaultUploadPaths   = "/upload"
-	appCodePattern       = `^[a-z][a-z0-9-]{1,31}$`
+	// DefaultStreamPaths 覆盖 AI SSE、MCP 的旧/新路径。
+	// 用不带前导斜杠的 stream，是为了同时匹配 /chat/stream 与 /chat/message/send-stream
+	// （后者在 stream 前是连字符，"/stream" 匹配不到）。
+	DefaultStreamPaths = "/sse,stream,/events,/mcp"
+	appCodePattern     = `^[a-z][a-z0-9-]{1,31}$`
 )
 
 var appCodeRe = regexp.MustCompile(appCodePattern)
+
+// LegacyRoute 是 yudao 旧路径兼容映射：入口前缀 → 应用编码。
+//
+// yudao-gateway 用 /admin-api/{module}/**、/app-api/{module}/** 这类
+// 「路径即服务」的规则；本工程默认使用 /admin/{app_code}/v1/** 的
+// 「路径即应用」规则。存量前端与第三方系统仍调用旧路径，因此提供显式映射：
+// 命中后保留原始路径原样转发，不做任何改写，行为与 yudao 的 Path 断言一致。
+type LegacyRoute struct {
+	// Prefix 是入口路径前缀，必须以 / 开头，例如 /admin-api/system。
+	Prefix string
+	// AppCode 是注册表中的应用编码，例如 yudao-system。
+	AppCode string
+}
 
 // AppConfig 是一条应用注册记录：应用编码与下游来源。
 // 地址可以为空（表示已注册但下游尚未接入），但静态地址与注册中心服务至少要有一个。
@@ -120,6 +154,8 @@ type TimeoutRules struct {
 	GeneratePaths []string
 	// UploadPaths 命中则按上传类预算（默认 30min）。
 	UploadPaths []string
+	// StreamPaths 命中则按流式预算（默认不设上限），优先于生成/读写预算。
+	StreamPaths []string
 }
 
 // Auth 是认证配置（沿用 yudao-cloud 网关的认证方式）。
@@ -147,6 +183,10 @@ type Timeouts struct {
 	Upload   time.Duration
 	Static   time.Duration
 	MCP      time.Duration
+	// Stream 是 SSE/MCP 长连接的整体预算，0 表示不设上限。
+	Stream time.Duration
+	// WSHandshake 是 WebSocket 握手阶段的超时。
+	WSHandshake time.Duration
 }
 
 // RateLimits 是限流分桶阈值。
@@ -167,6 +207,7 @@ type Config struct {
 	ExitWaitTime time.Duration
 
 	Apps           []AppConfig
+	LegacyRoutes   []LegacyRoute
 	MCPEnabled     bool
 	OpenAPIEnabled bool
 
@@ -253,12 +294,14 @@ func parse(lookup func(string) (string, bool)) (*Config, error) {
 		MaxBodyBytesUpload: reader.int64("MAX_BODY_BYTES_UPLOAD", DefaultMaxBodyBytesUpload, &errs),
 
 		Timeouts: Timeouts{
-			Read:     reader.duration("TIMEOUT_READ", DefaultTimeoutRead, &errs),
-			Write:    reader.duration("TIMEOUT_WRITE", DefaultTimeoutWrite, &errs),
-			Generate: reader.duration("TIMEOUT_GENERATE", DefaultTimeoutGenerate, &errs),
-			Upload:   reader.duration("TIMEOUT_UPLOAD", DefaultTimeoutUpload, &errs),
-			Static:   reader.duration("TIMEOUT_STATIC", DefaultTimeoutStatic, &errs),
-			MCP:      reader.duration("TIMEOUT_MCP", DefaultTimeoutMCP, &errs),
+			Read:        reader.duration("TIMEOUT_READ", DefaultTimeoutRead, &errs),
+			Write:       reader.duration("TIMEOUT_WRITE", DefaultTimeoutWrite, &errs),
+			Generate:    reader.duration("TIMEOUT_GENERATE", DefaultTimeoutGenerate, &errs),
+			Upload:      reader.duration("TIMEOUT_UPLOAD", DefaultTimeoutUpload, &errs),
+			Static:      reader.duration("TIMEOUT_STATIC", DefaultTimeoutStatic, &errs),
+			MCP:         reader.duration("TIMEOUT_MCP", DefaultTimeoutMCP, &errs),
+			Stream:      reader.duration("TIMEOUT_STREAM", DefaultTimeoutStream, &errs),
+			WSHandshake: reader.duration("TIMEOUT_WS_HANDSHAKE", DefaultWSHandshakeTimeout, &errs),
 		},
 		Rates: RateLimits{
 			Web:                    reader.int("RATE_WEB", DefaultRateWeb, &errs),
@@ -280,6 +323,12 @@ func parse(lookup func(string) (string, bool)) (*Config, error) {
 	}
 	cfg.Apps = apps
 
+	legacyRoutes, legacyErr := parseLegacyRoutes(reader)
+	if legacyErr != nil {
+		errs = append(errs, legacyErr)
+	}
+	cfg.LegacyRoutes = legacyRoutes
+
 	discovery, discoveryErr := parseDiscovery(reader)
 	if discoveryErr != nil {
 		errs = append(errs, discoveryErr)
@@ -292,8 +341,12 @@ func parse(lookup func(string) (string, bool)) (*Config, error) {
 		Cooldown:         reader.duration("BREAKER_COOLDOWN", DefaultBreakerCooldown, &errs),
 	}
 
-	generatePaths, uploadPaths := parsePathRules(reader)
-	cfg.TimeoutRules = TimeoutRules{GeneratePaths: generatePaths, UploadPaths: uploadPaths}
+	generatePaths, uploadPaths, streamPaths := parsePathRules(reader)
+	cfg.TimeoutRules = TimeoutRules{
+		GeneratePaths: generatePaths,
+		UploadPaths:   uploadPaths,
+		StreamPaths:   streamPaths,
+	}
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
@@ -381,12 +434,48 @@ func parseApps(reader envReader) ([]AppConfig, error) {
 	return apps, nil
 }
 
+// parseLegacyRoutes 解析 yudao 旧路径兼容映射。
+//
+// 语法：LEGACY_ROUTES=/admin-api/system=yudao-system,/app-api/system=yudao-system
+// 前缀必须以 / 开头；分隔符与 APPS 一致（逗号或分号）。
+// 留空表示不开启旧路径兼容，入口只接受 /{web|admin|mcp|open-api}/{app_code} 形式。
+func parseLegacyRoutes(reader envReader) ([]LegacyRoute, error) {
+	raw := reader.str("LEGACY_ROUTES", "")
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	entries := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' })
+	routes := make([]LegacyRoute, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		prefix, code, ok := strings.Cut(entry, "=")
+		prefix = strings.TrimSpace(prefix)
+		code = strings.TrimSpace(code)
+		if !ok || prefix == "" || code == "" {
+			return nil, fmt.Errorf("LEGACY_ROUTES 条目 %q 语法应为 前缀=应用编码", entry)
+		}
+		routes = append(routes, LegacyRoute{
+			Prefix:  strings.TrimSuffix(prefix, "/"),
+			AppCode: code,
+		})
+	}
+	if len(routes) == 0 {
+		return nil, errors.New("LEGACY_ROUTES 未解析出任何有效条目")
+	}
+	return routes, nil
+}
+
 // parsePathRules 解析超时分类的路径片段规则。
 // 空串表示使用默认规则；条目需以 / 开头，否则视为配置错误。
-func parsePathRules(reader envReader) (generate, upload []string) {
+func parsePathRules(reader envReader) (generate, upload, stream []string) {
 	generate = splitPathList(reader.str("TIMEOUT_GENERATE_PATHS", DefaultGeneratePaths))
 	upload = splitPathList(reader.str("TIMEOUT_UPLOAD_PATHS", DefaultUploadPaths))
-	return generate, upload
+	stream = splitPathList(reader.str("STREAM_PATHS", DefaultStreamPaths))
+	return generate, upload, stream
 }
 
 func splitPathList(raw string) []string {
@@ -461,6 +550,25 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// 旧路径兼容映射：前缀必须可路由，指向的应用必须真实存在，
+	// 否则请求会静默打到错误服务或反复 50201。
+	legacySeen := make(map[string]struct{}, len(c.LegacyRoutes))
+	for _, route := range c.LegacyRoutes {
+		if !strings.HasPrefix(route.Prefix, "/") || route.Prefix == "/" {
+			errs = append(errs, fmt.Errorf("LEGACY_ROUTES 前缀 %q 必须以 / 开头且不能是根路径", route.Prefix))
+		}
+		if strings.ContainsAny(route.Prefix, " ?#") || strings.Contains(route.Prefix, "//") {
+			errs = append(errs, fmt.Errorf("LEGACY_ROUTES 前缀 %q 含非法字符", route.Prefix))
+		}
+		if _, dup := legacySeen[route.Prefix]; dup {
+			errs = append(errs, fmt.Errorf("LEGACY_ROUTES 前缀重复: %q", route.Prefix))
+		}
+		legacySeen[route.Prefix] = struct{}{}
+		if _, ok := c.AppByCode(route.AppCode); !ok {
+			errs = append(errs, fmt.Errorf("LEGACY_ROUTES 前缀 %q 指向的应用 %q 不在 APPS 注册表中", route.Prefix, route.AppCode))
+		}
+	}
+
 	if c.Discovery.Enabled {
 		if err := validateListenAddr(c.Discovery.Addr); err != nil {
 			errs = append(errs, fmt.Errorf("DISCOVERY 地址非法: %w", err))
@@ -491,6 +599,17 @@ func (c *Config) Validate() error {
 	}
 	if err := validatePathRules("TIMEOUT_UPLOAD_PATHS", c.TimeoutRules.UploadPaths); err != nil {
 		errs = append(errs, err)
+	}
+	// STREAM_PATHS 允许为空：此时仍可通过 Accept: text/event-stream 识别流式请求。
+	if err := validateOptionalPathRules("STREAM_PATHS", c.TimeoutRules.StreamPaths); err != nil {
+		errs = append(errs, err)
+	}
+	// TIMEOUT_STREAM=0 是合法值（不设上限）；负值会让流式请求立即超时，必须拒绝。
+	if c.Timeouts.Stream < 0 {
+		errs = append(errs, fmt.Errorf("TIMEOUT_STREAM 不能为负数: %s", c.Timeouts.Stream))
+	}
+	if c.Timeouts.WSHandshake <= 0 {
+		errs = append(errs, fmt.Errorf("TIMEOUT_WS_HANDSHAKE 必须为正数: %s", c.Timeouts.WSHandshake))
 	}
 
 	if c.AuthIssuerBaseURL != "" {
@@ -552,6 +671,18 @@ func (c *Config) Validate() error {
 func IsValidAppCode(code string) bool { return appCodeRe.MatchString(code) }
 
 // validatePathRules 校验超时分类路径片段：非空且以 / 开头。
+// validateOptionalPathRules 校验可留空的路径片段列表。
+// 流式片段按「子串」匹配，允许不带前导斜杠（例如 stream 同时覆盖
+// /chat/stream 与 /chat/message/send-stream）；留空表示只依赖 Accept 头识别。
+func validateOptionalPathRules(name string, paths []string) error {
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			return fmt.Errorf("%s 含空白片段", name)
+		}
+	}
+	return nil
+}
+
 func validatePathRules(name string, paths []string) error {
 	if len(paths) == 0 {
 		return fmt.Errorf("%s 至少需要一个路径片段", name)
